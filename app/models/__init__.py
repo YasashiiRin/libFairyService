@@ -2,6 +2,7 @@
 
 from app.models.auth import PasswordResetToken, RefreshToken
 from app.models.base import Base
+from app.models.cache import SearchCache
 from app.models.library import LibraryItem, LibraryItemTag, Tag
 from app.models.notification import Notification
 from app.models.reading import ReadingGoal, ReadingLog
@@ -18,6 +19,7 @@ __all__ = [
     "ReadingGoal",
     "ReadingLog",
     "RefreshToken",
+    "SearchCache",
     "Shelf",
     "ShelfItem",
     "Tag",

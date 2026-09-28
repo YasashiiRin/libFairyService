@@ -6,5 +6,19 @@
       "excludeFiles": "{tests/**,.claude/**,.venv/**,**/__pycache__/**,*.md}"
     }
   },
-  "rewrites": [{ "source": "/(.*)", "destination": "/api/index" }]
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/api/index"
+    }
+  ],
+  "regions": [
+    "sin1"
+  ],
+  "crons": [
+    {
+      "path": "/api/cron/daily",
+      "schedule": "0 20 * * *"
+    }
+  ]
 }

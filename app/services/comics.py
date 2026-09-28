@@ -6,16 +6,21 @@ A Comic is one LibraryItem (its id is the Comic id) joined with its Work:
 - shared (works / work_sources): title, author, description, cover, total_chapters (= latest_chapter),
   genres (added to `tags`) and sources.
 
-Shared fields can be changed only while nobody else relies on them: the work is private (entered
-by hand) or this user is the only one who saved it. Otherwise → 409 shared_work. Adding a source
-is always allowed (it only adds information). Every query is scoped to one user.
+Editing a work's info: sole holders and owners of private works edit the work itself. When others
+saved it too, the edit is kept as this user's personal override (custom_* on the library item,
+hidden_source_ids / source_overrides for sources), so the shared work stays as it is. Adding a
+source always adds it to the work. Every query is scoped to one user.
+
+current_chapter may be above the known total (providers lag behind releases): it is kept, and
+recorded on the work as latest_chapter_hint for the daily check.
 """
 
 import uuid
 from datetime import UTC, date, datetime
+from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import Select, and_, bindparam, case, delete, exists, false, func, literal, or_, select, text
+from sqlalchemy import Select, all_, and_, bindparam, case, delete, exists, false, func, literal, or_, select, text
 from sqlalchemy.dialects.postgresql import ARRAY, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased, selectinload
@@ -49,6 +54,8 @@ STATUS_LABELS: dict[str, str] = {
     "on_hold": "Tạm dừng",
     "dropped": "Bỏ dở",
 }
+# details of a shared source a user may change for themselves (the link checker owns is_alive)
+SOURCE_OVERRIDE_FIELDS = ("site_name", "chapter_url", "favicon_url")
 
 
 def comic_not_found() -> ApiError:
@@ -61,15 +68,6 @@ def source_not_found() -> ApiError:
 
 def shelf_not_found() -> ApiError:
     return ApiError(404, "Không tìm thấy kệ sách", "shelf_not_found")
-
-
-def shared_work() -> ApiError:
-    return ApiError(
-        409,
-        "Truyện này đang được nhiều người lưu, nên chưa sửa được thông tin chung (tên, tác giả, ảnh bìa, nguồn đọc). "
-        "Nàng vẫn đổi được trạng thái, tiến độ, đánh giá, ghi chú và thẻ của riêng mình nhé.",
-        "shared_work",
-    )
 
 
 def source_url_taken() -> ApiError:
@@ -95,32 +93,52 @@ def split_authors(author: str) -> list[str]:
     return [a.strip() for a in author.split(",") if a.strip()]
 
 
-# ── Loading and serialising ──────────────────────────────────────────────
+# ── What one user sees ───────────────────────────────────────────────────
 
 
-def _with_relations(stmt: Select) -> Select:
-    return stmt.options(
-        selectinload(LibraryItem.work).selectinload(Work.sources),
-        selectinload(LibraryItem.tag_links).joinedload(LibraryItemTag.tag),
-        selectinload(LibraryItem.shelf_links),
-    )
+def view_title(item: LibraryItem) -> str:
+    return item.custom_title if item.custom_title is not None else item.work.title
 
 
-async def get_comic(db: AsyncSession, user_id: uuid.UUID, comic_id: str) -> LibraryItem:
-    item_id = parse_uuid(comic_id)
-    item = item_id and await db.scalar(
-        _with_relations(select(LibraryItem).where(LibraryItem.id == item_id, LibraryItem.user_id == user_id))
-    )
-    if not item:
-        raise comic_not_found()
-    return item
+def view_author(item: LibraryItem) -> str:
+    return item.custom_author if item.custom_author is not None else item.work.author
 
 
-async def reload(db: AsyncSession, item: LibraryItem) -> LibraryItem:
-    """Fresh copy with relations, after changes (server defaults and orderings applied)."""
-    await db.flush()
-    return await db.scalar(
-        _with_relations(select(LibraryItem).where(LibraryItem.id == item.id)).execution_options(populate_existing=True)
+def view_description(item: LibraryItem) -> str:
+    return item.custom_description if item.custom_description is not None else item.work.description
+
+
+def known_total(item: LibraryItem) -> int:
+    """The total this user sees: their own, or the work's latest chapter (current_chapter may be above it)."""
+    return item.custom_total_chapters if item.custom_total_chapters is not None else item.work.latest_chapter
+
+
+def cover_url_of(item: LibraryItem) -> str:
+    """Stored images are served under the item's own signed URL (a personal cover, else the work's)."""
+    work = item.work
+    if item.custom_cover_updated_at:
+        return images.media_url("cover", item.id, item.custom_cover_updated_at)
+    if item.custom_cover_url is not None:
+        return item.custom_cover_url
+    return images.media_url("cover", item.id, work.cover_updated_at) if work.cover_updated_at else work.cover_url
+
+
+def visible_sources(item: LibraryItem) -> list[WorkSource]:
+    hidden = set(item.hidden_source_ids or [])
+    return [s for s in item.work.sources if s.id not in hidden]
+
+
+def source_out(s: WorkSource, override: dict[str, Any] | None = None) -> SourceOut:
+    o = override or {}
+    return SourceOut(
+        id=str(s.id),
+        site_name=o.get("site_name", s.site_name),
+        url=s.url,
+        favicon_url=o.get("favicon_url", s.favicon_url),
+        chapter_url=o.get("chapter_url", s.chapter_url),
+        latest_chapter=s.latest_chapter,
+        is_alive=s.is_alive,
+        last_checked_at=s.last_checked_at,
     )
 
 
@@ -134,43 +152,29 @@ def merge_tags(own: list[str], genres: list[str]) -> list[str]:
     return out
 
 
-def source_out(s: WorkSource) -> SourceOut:
-    return SourceOut(
-        id=str(s.id),
-        site_name=s.site_name,
-        url=s.url,
-        favicon_url=s.favicon_url,
-        chapter_url=s.chapter_url,
-        latest_chapter=s.latest_chapter,
-        is_alive=s.is_alive,
-        last_checked_at=s.last_checked_at,
-    )
-
-
-def cover_url_of(item: LibraryItem) -> str:
-    work = item.work
-    # stored once on the work, served under the item's own signed URL
-    return images.media_url("cover", item.id, work.cover_updated_at) if work.cover_updated_at else work.cover_url
+def _primary(item: LibraryItem) -> WorkSource | None:
+    sources = visible_sources(item)
+    return next((s for s in sources if s.id == item.primary_source_id), None) or (sources[0] if sources else None)
 
 
 def comic_out(item: LibraryItem) -> ComicOut:
-    work = item.work
-    primary = item.primary_source_id or (work.sources[0].id if work.sources else None)
+    overrides = item.source_overrides or {}
+    primary = _primary(item)
     return ComicOut(
         id=str(item.id),
-        title=work.title,
-        author=work.author,
-        description=work.description,
+        title=view_title(item),
+        author=view_author(item),
+        description=view_description(item),
         cover_url=cover_url_of(item),
         status=item.status,  # type: ignore[arg-type]
-        current_chapter=min(item.current_chapter, work.latest_chapter),
-        total_chapters=work.latest_chapter,
+        current_chapter=item.current_chapter,
+        total_chapters=known_total(item),
         rating=item.rating,
         is_favorite=item.is_favorite,
         note=item.note,
-        tags=merge_tags([link.tag.name for link in item.tag_links], work.genres),
-        sources=[source_out(s) for s in work.sources],
-        primary_source_id=str(primary) if primary else "",
+        tags=merge_tags([link.tag.name for link in item.tag_links], item.work.genres),
+        sources=[source_out(s, overrides.get(str(s.id))) for s in visible_sources(item)],
+        primary_source_id=str(primary.id) if primary else "",
         shelf_ids=[ALL_SHELF, *(str(link.shelf_id) for link in sorted(item.shelf_links, key=lambda sl: sl.added_at))],
         has_new_chapter=item.has_new_chapter,
         last_read_at=item.last_read_at,
@@ -179,7 +183,36 @@ def comic_out(item: LibraryItem) -> ComicOut:
     )
 
 
-# ── Listing and search ───────────────────────────────────────────────────
+# ── Loading ──────────────────────────────────────────────────────────────
+
+
+def with_relations(stmt: Select) -> Select:
+    return stmt.options(
+        selectinload(LibraryItem.work).selectinload(Work.sources),
+        selectinload(LibraryItem.tag_links).joinedload(LibraryItemTag.tag),
+        selectinload(LibraryItem.shelf_links),
+    )
+
+
+async def get_comic(db: AsyncSession, user_id: uuid.UUID, comic_id: str) -> LibraryItem:
+    item_id = parse_uuid(comic_id)
+    item = item_id and await db.scalar(
+        with_relations(select(LibraryItem).where(LibraryItem.id == item_id, LibraryItem.user_id == user_id))
+    )
+    if not item:
+        raise comic_not_found()
+    return item
+
+
+async def reload(db: AsyncSession, item: LibraryItem) -> LibraryItem:
+    """Fresh copy with relations, after changes (server defaults and orderings applied)."""
+    await db.flush()
+    return await db.scalar(
+        with_relations(select(LibraryItem).where(LibraryItem.id == item.id)).execution_options(populate_existing=True)
+    )
+
+
+# ── Listing and search (on what the user sees) ───────────────────────────
 
 
 def _fold(expr) -> ColumnElement:
@@ -191,15 +224,29 @@ def _like_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def _progress_pct() -> ColumnElement:
-    return case(
-        (Work.latest_chapter > 0, func.least(LibraryItem.current_chapter, Work.latest_chapter) * 100.0 / Work.latest_chapter),
-        else_=0.0,
-    )
-
-
 def _joined(arr) -> ColumnElement:
     return func.array_to_string(arr, " | ")
+
+
+def _title_col() -> ColumnElement:
+    return func.coalesce(LibraryItem.custom_title, Work.title)
+
+
+def _author_col() -> ColumnElement:
+    return func.coalesce(LibraryItem.custom_author, _joined(Work.authors))
+
+
+def _total_col() -> ColumnElement:
+    return func.coalesce(LibraryItem.custom_total_chapters, Work.latest_chapter)
+
+
+def _progress_pct() -> ColumnElement:
+    total = _total_col()
+    return case((total > 0, func.least(LibraryItem.current_chapter, total) * 100.0 / total), else_=0.0)
+
+
+def _visible(source_id) -> ColumnElement:
+    return source_id != all_(LibraryItem.hidden_source_ids)
 
 
 class ListFilters:
@@ -245,9 +292,13 @@ def _text_match(q: str) -> tuple[ColumnElement, ColumnElement]:
     folded = _fold(literal(_like_escape(q)))
     contains = func.concat("%", folded, "%")
     prefix = func.concat(folded, "%")
-    title = _fold(Work.title)
-    in_title = or_(title.like(contains, escape="\\"), _fold(_joined(Work.alt_titles)).like(contains, escape="\\"))
-    in_author = _fold(_joined(Work.authors)).like(contains, escape="\\")
+    title = _fold(_title_col())
+    in_title = or_(
+        title.like(contains, escape="\\"),
+        _fold(Work.title).like(contains, escape="\\"),  # the shared title still finds a renamed comic
+        _fold(_joined(Work.alt_titles)).like(contains, escape="\\"),
+    )
+    in_author = _fold(_author_col()).like(contains, escape="\\")
     in_note = _fold(LibraryItem.note).like(contains, escape="\\")
     in_tags = or_(
         _own_tag_exists(_fold(Tag.name).like(contains, escape="\\")),
@@ -275,7 +326,13 @@ def _conditions(user_id: uuid.UUID, f: ListFilters) -> list[ColumnElement]:
         )
         conds.append(or_(_own_tag_exists(func.lower(Tag.name).in_(lowered)), genre_match))
     if f.source:
-        conds.append(exists(select(1).where(WorkSource.work_id == LibraryItem.work_id, WorkSource.site_name.in_(f.source))))
+        conds.append(
+            exists(
+                select(1).where(
+                    WorkSource.work_id == LibraryItem.work_id, WorkSource.site_name.in_(f.source), _visible(WorkSource.id)
+                )
+            )
+        )
     if f.shelf:
         shelf_ids = [sid for sid in (parse_uuid(s) for s in f.shelf) if sid]
         conds.append(
@@ -292,7 +349,13 @@ def _conditions(user_id: uuid.UUID, f: ListFilters) -> list[ColumnElement]:
     if f.has_new_chapter:
         conds.append(LibraryItem.has_new_chapter.is_(True))
     if f.has_broken_link:
-        conds.append(exists(select(1).where(WorkSource.work_id == LibraryItem.work_id, WorkSource.is_alive.is_(False))))
+        conds.append(
+            exists(
+                select(1).where(
+                    WorkSource.work_id == LibraryItem.work_id, WorkSource.is_alive.is_(False), _visible(WorkSource.id)
+                )
+            )
+        )
     if f.is_favorite:
         conds.append(LibraryItem.is_favorite.is_(True))
     return conds
@@ -310,7 +373,7 @@ async def list_comics(
     if sort == "relevance":
         order = [_text_match(f.q)[1].desc(), newest] if f.q else [newest]
     elif sort == "title":
-        order = [Work.title.collate(VI_COLLATION).asc()]
+        order = [_title_col().collate(VI_COLLATION).asc()]
     elif sort == "rating":
         order = [LibraryItem.rating.desc(), newest]
     elif sort == "progress":
@@ -326,7 +389,7 @@ async def list_comics(
         order = [newest]
 
     rows = await db.scalars(
-        _with_relations(stmt.order_by(*order, LibraryItem.id).limit(page_size).offset((page - 1) * page_size))
+        with_relations(stmt.order_by(*order, LibraryItem.id).limit(page_size).offset((page - 1) * page_size))
     )
     return list(rows), total
 
@@ -377,7 +440,7 @@ async def facets(db: AsyncSession, user_id: uuid.UUID) -> SearchFacets:
         await db.execute(
             select(WorkSource.site_name, func.count(func.distinct(LibraryItem.id)), func.max(WorkSource.favicon_url))
             .join(LibraryItem, LibraryItem.work_id == WorkSource.work_id)
-            .where(LibraryItem.user_id == user_id)
+            .where(LibraryItem.user_id == user_id, _visible(WorkSource.id))
             .group_by(WorkSource.site_name)
             .order_by(func.count(func.distinct(LibraryItem.id)).desc(), WorkSource.site_name)
         )
@@ -405,10 +468,10 @@ async def lookup(db: AsyncSession, user_id: uuid.UUID, title: str) -> LibraryIte
     if not t:
         return None
     return await db.scalar(
-        _with_relations(
+        with_relations(
             select(LibraryItem)
             .join(Work, Work.id == LibraryItem.work_id)
-            .where(LibraryItem.user_id == user_id, func.lower(func.btrim(Work.title)) == func.lower(t))
+            .where(LibraryItem.user_id == user_id, func.lower(func.btrim(_title_col())) == func.lower(t))
             .order_by(LibraryItem.created_at)
             .limit(1)
         )
@@ -456,7 +519,7 @@ async def delete_unused_tags(db: AsyncSession, user_id: uuid.UUID) -> None:
 # ── Shelves (membership only; shelves themselves are managed in /api/shelves) ─
 
 
-async def _set_shelves(db: AsyncSession, item: LibraryItem, shelf_ids: list[str]) -> None:
+async def set_shelves(db: AsyncSession, item: LibraryItem, shelf_ids: list[str]) -> None:
     wanted = list(dict.fromkeys(sid for sid in (parse_uuid(s) for s in shelf_ids) if sid))
     if wanted:
         owned = set(await db.scalars(select(Shelf.id).where(Shelf.user_id == item.user_id, Shelf.id.in_(wanted))))
@@ -466,22 +529,27 @@ async def _set_shelves(db: AsyncSession, item: LibraryItem, shelf_ids: list[str]
     item.shelf_links = [links.get(sid) or ShelfItem(shelf_id=sid, position=None) for sid in wanted]
 
 
-# ── Shared-work rules ────────────────────────────────────────────────────
+# ── Shared work or personal override ─────────────────────────────────────
 
 
 async def holders(db: AsyncSession, work_id: uuid.UUID) -> int:
     return await db.scalar(select(func.count()).select_from(LibraryItem).where(LibraryItem.work_id == work_id)) or 0
 
 
-async def _require_editable(db: AsyncSession, item: LibraryItem) -> None:
-    """Shared fields may change only if the work is this user's private work, or nobody else saved it."""
-    if item.work.owner_user_id == item.user_id:
-        return
-    if await holders(db, item.work_id) > 1:
-        raise shared_work()
+async def edits_work(db: AsyncSession, item: LibraryItem) -> bool:
+    """True: this user's edits change the work itself (their private work, or nobody else saved it).
+    False: the work is shared, so edits become this user's personal overrides."""
+    return item.work.owner_user_id == item.user_id or await holders(db, item.work_id) <= 1
 
 
-async def _find_source_by_url(db: AsyncSession, url: str, owner_id: uuid.UUID | None) -> WorkSource | None:
+def note_progress(item: LibraryItem) -> None:
+    """A reader past the work's latest chapter: remember it for the daily check."""
+    work = item.work
+    if item.current_chapter > work.latest_chapter:
+        work.latest_chapter_hint = max(work.latest_chapter_hint or 0, item.current_chapter)
+
+
+async def find_source_by_url(db: AsyncSession, url: str, owner_id: uuid.UUID | None) -> WorkSource | None:
     """The source with this (normalized) page link in one scope: shared works, or one user's private works.
     A bare site link never matches (it doesn't identify a work)."""
     if not identifies_work(url):
@@ -491,7 +559,7 @@ async def _find_source_by_url(db: AsyncSession, url: str, owner_id: uuid.UUID | 
 
 
 async def _check_url_free(db: AsyncSession, work: Work, url: str, except_id: uuid.UUID | None = None) -> None:
-    other = await _find_source_by_url(db, url, work.owner_user_id)
+    other = await find_source_by_url(db, url, work.owner_user_id)
     if other is not None and other.id != except_id:
         raise source_url_taken()
 
@@ -507,7 +575,7 @@ def _apply_source(src: WorkSource, data: SourceIn | SourceUpdate) -> None:
         src.chapter_url = src.url
 
 
-def _new_source(work: Work, user_id: uuid.UUID) -> WorkSource:
+def new_source(work: Work, user_id: uuid.UUID) -> WorkSource:
     return WorkSource(
         work_id=work.id,
         private_owner_id=work.owner_user_id,
@@ -532,118 +600,192 @@ def _as_input(src: WorkSource, client_id: str | None = None) -> SourceIn:
     )
 
 
-def _source_changed(src: WorkSource, data: SourceIn) -> bool:
+async def _add_to_work(db: AsyncSession, item: LibraryItem, data: SourceIn | SourceUpdate, url: str) -> WorkSource:
+    """The work's source with this link (unhidden for this user), or a new one added to the work."""
+    work = item.work
+    src = next((s for s in work.sources if s.url == url), None)
+    if src is None:
+        await _check_url_free(db, work, url)
+        src = new_source(work, item.user_id)
+        src.position = len(work.sources)
+        _apply_source(src, data)
+        src.url = url
+        work.sources.append(src)
+        work.updated_at = _now()
+        await db.flush()
+    _unhide(item, src.id)
+    return src
+
+
+def _hide(item: LibraryItem, source_id: uuid.UUID) -> None:
+    if source_id not in (item.hidden_source_ids or []):
+        item.hidden_source_ids = [*(item.hidden_source_ids or []), source_id]
+
+
+def _unhide(item: LibraryItem, source_id: uuid.UUID) -> None:
+    if source_id in (item.hidden_source_ids or []):
+        item.hidden_source_ids = [s for s in item.hidden_source_ids if s != source_id]
+
+
+def _set_source_override(item: LibraryItem, src: WorkSource, data: SourceIn | SourceUpdate) -> None:
+    """Personal details for a shared source: only the fields that differ from the shared values."""
+    overrides = dict(item.source_overrides or {})
+    mine = dict(overrides.get(str(src.id), {}))
+    for field in SOURCE_OVERRIDE_FIELDS:
+        value = getattr(data, field)
+        if field == "chapter_url" and value is not None:
+            value = normalize_url(value) if value else src.url
+        if value is None:
+            continue
+        if value == getattr(src, field):
+            mine.pop(field, None)
+        else:
+            mine[field] = value
+    if mine:
+        overrides[str(src.id)] = mine
+    else:
+        overrides.pop(str(src.id), None)
+    item.source_overrides = overrides
+    if data.latest_chapter is not None and data.latest_chapter > src.latest_chapter:
+        # a reader says the site has more chapters: a hint, not a shared change
+        item.work.latest_chapter_hint = max(item.work.latest_chapter_hint or 0, data.latest_chapter)
+
+
+def _details_changed(src: WorkSource, data: SourceIn, override: dict[str, Any]) -> bool:
+    view = {f: override.get(f, getattr(src, f)) for f in SOURCE_OVERRIDE_FIELDS}
     chapter_url = normalize_url(data.chapter_url) if data.chapter_url else normalize_url(data.url)
     return (
-        normalize_url(data.url) != src.url
-        or data.site_name != src.site_name
-        or chapter_url != normalize_url(src.chapter_url)
-        or data.latest_chapter != src.latest_chapter
-        or data.is_alive != src.is_alive
-        or data.favicon_url != src.favicon_url
+        data.site_name != view["site_name"]
+        or chapter_url != normalize_url(view["chapter_url"])
+        or data.favicon_url != view["favicon_url"]
     )
 
 
 async def _set_sources(db: AsyncSession, item: LibraryItem, entries: list[SourceIn], primary: str | None) -> None:
-    """Replace the work's source list, then point this user's primary source.
+    """Replace the source list this user sees, then point their primary source.
 
-    Existing sources are matched by id (or by link); new ones get server ids. `primary` may be an
-    existing source id or the client id of a new one. Removing or editing sources of a work other
-    people saved is refused (409); adding is fine.
+    Entries are matched to the work's sources by id (or by link); unknown ones are new. `primary`
+    may be an existing source id or the client id of a new one. On a work only this user relies on,
+    the work's list itself is replaced; on a shared work, removed sources are hidden for this user,
+    changed details become their overrides, a changed link adds that link, and new sources are
+    added to the work.
     """
     work = item.work
     by_id = {str(s.id): s for s in work.sources}
     by_url = {s.url: s for s in work.sources}
     current_primary = str(item.primary_source_id) if item.primary_source_id else None
-
     resolved = [(e, by_id.get(e.id or "") or by_url.get(normalize_url(e.url))) for e in entries]
-    kept = {m.id for _, m in resolved if m is not None}
-    if any(s.id not in kept for s in work.sources) or any(m is not None and _source_changed(m, e) for e, m in resolved):
-        await _require_editable(db, item)
-
-    item.primary_source_id = None
-    await db.flush()
-
     by_client_id: dict[str, WorkSource] = {}
-    new_list: list[WorkSource] = []
-    for entry, src in resolved:
-        url = normalize_url(entry.url)
-        if src is None:
-            await _check_url_free(db, work, url)
-            src = _new_source(work, item.user_id)
-        elif url != src.url:
-            await _check_url_free(db, work, url, except_id=src.id)
-        _apply_source(src, entry)
-        if src not in new_list:
-            new_list.append(src)
-        if entry.id:
-            by_client_id[entry.id] = src
-    for position, src in enumerate(new_list):
-        src.position = position
-    work.sources = new_list
-    await db.flush()
+
+    if await edits_work(db, item):
+        item.primary_source_id = None
+        await db.flush()
+        new_list: list[WorkSource] = []
+        for entry, src in resolved:
+            url = normalize_url(entry.url)
+            if src is None:
+                await _check_url_free(db, work, url)
+                src = new_source(work, item.user_id)
+            elif url != src.url:
+                await _check_url_free(db, work, url, except_id=src.id)
+            _apply_source(src, entry)
+            if src not in new_list:
+                new_list.append(src)
+            if entry.id:
+                by_client_id[entry.id] = src
+        for position, src in enumerate(new_list):
+            src.position = position
+        work.sources = new_list
+        item.hidden_source_ids = []
+        item.source_overrides = {}
+        await db.flush()
+        shown = new_list
+    else:
+        overrides = item.source_overrides or {}
+        shown = []
+        for entry, src in resolved:
+            url = normalize_url(entry.url)
+            if src is None:
+                src = await _add_to_work(db, item, entry, url)
+            elif url != src.url:
+                _hide(item, src.id)  # a different link: the old one goes away for this user only
+                src = await _add_to_work(db, item, entry, url)
+            else:
+                _unhide(item, src.id)
+                if _details_changed(src, entry, overrides.get(str(src.id), {})):
+                    _set_source_override(item, src, entry)
+            if src not in shown:
+                shown.append(src)
+            if entry.id:
+                by_client_id[entry.id] = src
+        for src in work.sources:
+            if src not in shown:
+                _hide(item, src.id)
 
     def pick() -> WorkSource | None:
-        # the requested primary, else the current one if it was kept, else the first source
+        # the requested primary, else the current one if it is still shown, else the first source
         for key in (primary, current_primary):
             if key:
-                match = by_client_id.get(key) or next((s for s in new_list if str(s.id) == key), None)
+                match = by_client_id.get(key) or next((s for s in shown if str(s.id) == key), None)
                 if match is not None:
                     return match
-        return new_list[0] if new_list else None
+        return shown[0] if shown else None
 
     chosen = pick()
     item.primary_source_id = chosen.id if chosen else None
-    work.updated_at = _now()
 
 
 def _find_source(item: LibraryItem, source_id: str) -> WorkSource:
-    src = next((s for s in item.work.sources if str(s.id) == source_id), None)
+    src = next((s for s in visible_sources(item) if str(s.id) == source_id), None)
     if src is None:
         raise source_not_found()
     return src
 
 
 async def add_source(db: AsyncSession, item: LibraryItem, data: SourceIn) -> LibraryItem:
-    work = item.work
-    url = normalize_url(data.url)
-    if not any(s.url == url for s in work.sources):  # already there: nothing to add
-        await _check_url_free(db, work, url)
-        src = _new_source(work, item.user_id)
-        src.position = len(work.sources)
-        _apply_source(src, data)
-        work.sources.append(src)
-        work.updated_at = _now()
-        await db.flush()
+    """Always adds to the work (adding only adds information), shared or not."""
+    await _add_to_work(db, item, data, normalize_url(data.url))
     item.updated_at = _now()
     return await reload(db, item)
 
 
 async def update_source(db: AsyncSession, item: LibraryItem, source_id: str, data: SourceUpdate) -> LibraryItem:
     src = _find_source(item, source_id)
-    await _require_editable(db, item)
-    if data.url is not None and normalize_url(data.url) != src.url:
-        await _check_url_free(db, item.work, normalize_url(data.url), except_id=src.id)
-    _apply_source(src, data)
-    item.work.updated_at = item.updated_at = _now()
+    if await edits_work(db, item):
+        if data.url is not None and normalize_url(data.url) != src.url:
+            await _check_url_free(db, item.work, normalize_url(data.url), except_id=src.id)
+        _apply_source(src, data)
+        item.work.updated_at = _now()
+    elif data.url is not None and normalize_url(data.url) != src.url:
+        _hide(item, src.id)
+        new = await _add_to_work(db, item, SourceIn(**{**_as_input(src).model_dump(), **data.model_dump(exclude_none=True)}), normalize_url(data.url))
+        if item.primary_source_id == src.id:
+            item.primary_source_id = new.id
+    else:
+        _set_source_override(item, src, data)
+    item.updated_at = _now()
     return await reload(db, item)
 
 
 async def delete_source(db: AsyncSession, item: LibraryItem, source_id: str) -> LibraryItem:
     src = _find_source(item, source_id)
-    await _require_editable(db, item)
-    work = item.work
-    remaining = [s for s in work.sources if s is not src]
-    if item.primary_source_id == src.id:
-        item.primary_source_id = None
+    if await edits_work(db, item):
+        work = item.work
+        remaining = [s for s in work.sources if s is not src]
+        if item.primary_source_id == src.id:
+            item.primary_source_id = None
+            await db.flush()
+        work.sources = remaining
+        for position, s in enumerate(remaining):
+            s.position = position
+        work.updated_at = _now()
         await db.flush()
-    work.sources = remaining
-    for position, s in enumerate(remaining):
-        s.position = position
-    await db.flush()
-    if item.primary_source_id is None and remaining:
-        item.primary_source_id = remaining[0].id
-    work.updated_at = item.updated_at = _now()
+    else:
+        _hide(item, src.id)  # gone for this user; the shared work keeps it
+    if item.primary_source_id in (None, src.id):
+        shown = visible_sources(item)
+        item.primary_source_id = shown[0].id if shown else None
+    item.updated_at = _now()
     return await reload(db, item)
 
 
@@ -656,14 +798,8 @@ async def set_primary_source(db: AsyncSession, item: LibraryItem, source_id: str
 # ── Cover ────────────────────────────────────────────────────────────────
 
 
-def set_cover_image(work: Work, webp: bytes) -> None:
-    work.cover = webp
-    work.cover_url = ""
-    work.cover_updated_at = _now()
-
-
 def _cover_change(value: str, current: str | None) -> bytes | str | None:
-    """What a cover_url from the client means: WebP bytes to store, an external link, or None (unchanged)."""
+    """What a cover_url from the client means: WebP bytes to store, a link, or None (unchanged)."""
     value = value.strip()
     if images.is_data_url(value):
         return images.cover_thumbnail(images.decode_data_url(value))
@@ -674,18 +810,40 @@ def _cover_change(value: str, current: str | None) -> bytes | str | None:
     return value
 
 
-def _apply_cover(work: Work, change: bytes | str) -> None:
+def set_work_cover(work: Work, change: bytes | str) -> None:
     if isinstance(change, bytes):
-        set_cover_image(work, change)
+        work.cover, work.cover_url, work.cover_updated_at = change, "", _now()
     else:
-        work.cover_url = change
-        work.cover = None
-        work.cover_updated_at = None
+        work.cover, work.cover_url, work.cover_updated_at = None, change, None
+
+
+def _clear_custom_cover(item: LibraryItem) -> None:
+    item.custom_cover = None
+    item.custom_cover_url = None
+    item.custom_cover_updated_at = None
+
+
+def _set_custom_cover(item: LibraryItem, change: bytes | str) -> None:
+    work = item.work
+    if isinstance(change, bytes):
+        item.custom_cover, item.custom_cover_url, item.custom_cover_updated_at = change, None, _now()
+    elif change == work.cover_url and not work.cover_updated_at:
+        _clear_custom_cover(item)  # back to the shared cover
+    else:
+        item.custom_cover, item.custom_cover_url, item.custom_cover_updated_at = None, change, None
+
+
+async def _apply_cover(db: AsyncSession, item: LibraryItem, change: bytes | str) -> None:
+    if await edits_work(db, item):
+        set_work_cover(item.work, change)
+        item.work.updated_at = _now()
+        _clear_custom_cover(item)
+    else:
+        _set_custom_cover(item, change)
 
 
 async def upload_cover(db: AsyncSession, item: LibraryItem, webp: bytes) -> LibraryItem:
-    await _require_editable(db, item)
-    set_cover_image(item.work, webp)
+    await _apply_cover(db, item, webp)
     item.updated_at = _now()
     return await reload(db, item)
 
@@ -697,7 +855,7 @@ async def _work_with_links(db: AsyncSession, user_id: uuid.UUID, urls: list[str]
     """A shared work (or one of the user's own private works) that already has one of these links."""
     work_ids = set()
     for url in urls:
-        src = await _find_source_by_url(db, url, None) or await _find_source_by_url(db, url, user_id)
+        src = await find_source_by_url(db, url, None) or await find_source_by_url(db, url, user_id)
         if src is not None:
             work_ids.add(src.work_id)
     if len(work_ids) > 1:
@@ -712,16 +870,16 @@ async def create_comic(db: AsyncSession, user_id: uuid.UUID, data: ComicCreate) 
     that work, their existing item comes back unchanged. Otherwise a new private work is created.
     """
     work = await _work_with_links(db, user_id, [normalize_url(s.url) for s in data.sources])
-    if work is not None:
+    joined = work is not None
+    if joined:
         mine = await db.scalar(
-            _with_relations(select(LibraryItem).where(LibraryItem.user_id == user_id, LibraryItem.work_id == work.id))
+            with_relations(select(LibraryItem).where(LibraryItem.user_id == user_id, LibraryItem.work_id == work.id))
         )
         if mine is not None:
             return mine, False
         # joining a work others saved: add what it lacks, never overwrite what it has
         if data.title != work.title and data.title not in work.alt_titles:
             work.alt_titles = [*work.alt_titles, data.title]
-        work.latest_chapter = max(work.latest_chapter, data.total_chapters)
         await db.refresh(work, ["sources"])
     else:
         work = Work(
@@ -739,25 +897,30 @@ async def create_comic(db: AsyncSession, user_id: uuid.UUID, data: ComicCreate) 
         await db.flush()
         change = _cover_change(data.cover_url, None)
         if change:
-            _apply_cover(work, change)
+            set_work_cover(work, change)
 
     item = LibraryItem(
         user_id=user_id,
         work=work,
         status=data.status,
-        current_chapter=min(data.current_chapter, work.latest_chapter),
+        current_chapter=data.current_chapter,
         rating=data.rating,
         is_favorite=data.is_favorite,
         note=data.note,
         has_new_chapter=data.has_new_chapter,
         last_read_at=data.last_read_at,
+        hidden_source_ids=[],
+        source_overrides={},
         tag_links=[],
         shelf_links=[],
     )
+    if joined and data.total_chapters > work.latest_chapter:
+        item.custom_total_chapters = data.total_chapters  # their count, not (yet) the shared one
     db.add(item)
     await db.flush()
+    note_progress(item)
     await _set_tags(db, item, data.tags)
-    await _set_shelves(db, item, data.shelf_ids)
+    await set_shelves(db, item, data.shelf_ids)
 
     # keep the work's sources as they are; links it already has map onto them (under the client's id,
     # so primary_source_id still resolves); the rest are added
@@ -770,51 +933,72 @@ async def create_comic(db: AsyncSession, user_id: uuid.UUID, data: ComicCreate) 
     return await reload(db, item), True
 
 
+def _override(value: str | None, shared: str) -> str | None:
+    return None if value == shared else value
+
+
 async def update_comic(db: AsyncSession, item: LibraryItem, data: ComicUpdate) -> LibraryItem:
     fields = data.model_fields_set
     work = item.work
 
-    # shared fields: only real changes count (the edit form sends unchanged values too)
-    shared: dict[str, object] = {}
-    if data.title is not None and data.title != work.title:
-        shared["title"] = data.title
-    if data.author is not None and split_authors(data.author) != work.authors:
-        shared["authors"] = split_authors(data.author)
-    if data.description is not None and data.description != work.description:
-        shared["description"] = data.description
-    if data.total_chapters is not None and data.total_chapters != work.latest_chapter:
-        shared["latest_chapter"] = data.total_chapters
+    # the work's info: only real changes count (the edit form sends unchanged values too)
+    changes: dict[str, object] = {}
+    if data.title is not None and data.title != view_title(item):
+        changes["title"] = data.title
+    if data.author is not None and split_authors(data.author) != split_authors(view_author(item)):
+        changes["author"] = ", ".join(split_authors(data.author))
+    if data.description is not None and data.description != view_description(item):
+        changes["description"] = data.description
+    if data.total_chapters is not None and data.total_chapters != known_total(item):
+        changes["total"] = data.total_chapters
     cover = _cover_change(data.cover_url, cover_url_of(item)) if data.cover_url is not None else None
-    if shared or cover is not None:
-        await _require_editable(db, item)
-        for name, value in shared.items():
-            setattr(work, name, value)
-        if cover is not None:
-            _apply_cover(work, cover)
-        work.updated_at = _now()
+
+    if changes:
+        if await edits_work(db, item):
+            if "title" in changes:
+                work.title, item.custom_title = changes["title"], None
+            if "author" in changes:
+                work.authors, item.custom_author = split_authors(changes["author"]), None
+            if "description" in changes:
+                work.description, item.custom_description = changes["description"], None
+            if "total" in changes:
+                work.latest_chapter, item.custom_total_chapters = changes["total"], None
+            work.updated_at = _now()
+        else:
+            if "title" in changes:
+                item.custom_title = _override(changes["title"], work.title)
+            if "author" in changes:
+                item.custom_author = _override(changes["author"], work.author)
+            if "description" in changes:
+                item.custom_description = _override(changes["description"], work.description)
+            if "total" in changes:
+                total = changes["total"]
+                item.custom_total_chapters = None if total == work.latest_chapter else total
+    if cover is not None:
+        await _apply_cover(db, item, cover)
 
     # per-user fields
     for name in ("status", "rating", "is_favorite", "note", "has_new_chapter", "last_read_at"):
         if name in fields and (getattr(data, name) is not None or name == "last_read_at"):
             setattr(item, name, getattr(data, name))
     if data.current_chapter is not None:
-        if data.current_chapter > work.latest_chapter:
-            raise ApiError(422, "Chương đang đọc không thể lớn hơn tổng số chương", "validation_error")
-        item.current_chapter = data.current_chapter
-    elif item.current_chapter > work.latest_chapter:
-        item.current_chapter = work.latest_chapter  # lowering the total pulls the progress down with it
+        item.current_chapter = data.current_chapter  # may be above the total: kept, and noted below
+    elif "total" in changes and item.current_chapter > known_total(item):
+        item.current_chapter = known_total(item)  # lowering the total on purpose pulls the progress down with it
+    note_progress(item)
 
     if data.tags is not None:
         await _set_tags(db, item, data.tags)
     if data.shelf_ids is not None:
-        await _set_shelves(db, item, data.shelf_ids)
+        await set_shelves(db, item, data.shelf_ids)
     if data.sources is not None:
         await _set_sources(db, item, data.sources, data.primary_source_id)
     elif "primary_source_id" in fields:
         if data.primary_source_id:
             item.primary_source_id = _find_source(item, data.primary_source_id).id
         else:
-            item.primary_source_id = work.sources[0].id if work.sources else None
+            shown = visible_sources(item)
+            item.primary_source_id = shown[0].id if shown else None
     item.updated_at = _now()
     if data.tags is not None:
         await delete_unused_tags(db, item.user_id)
@@ -845,17 +1029,24 @@ async def set_favorite(db: AsyncSession, item: LibraryItem, value: bool) -> Libr
 
 
 async def set_progress(db: AsyncSession, item: LibraryItem, chapter: int) -> LibraryItem:
-    """Clamp to 0..total, finish at the end, log the chapters read today (api-contract.md, PUT progress)."""
+    """Set the reading progress and log the chapters read today (api-contract.md, PUT progress).
+
+    Never capped at the total: a chapter above it is kept and noted as a hint that the total is
+    outdated. Reaching the total exactly finishes the comic, unless the work is known to be ongoing;
+    going past it means there are more chapters, so it stays "reading".
+    """
     work = item.work
-    total = work.latest_chapter
-    new = min(max(0, chapter), total)
-    read = new - min(item.current_chapter, total)
+    total = known_total(item)
+    new = max(0, chapter)
+    read = new - item.current_chapter
     now = _now()
     item.current_chapter = new
-    item.status = "completed" if total > 0 and new >= total else "reading"
+    finished = total > 0 and (new == total or (new > total and work.publication_status == "completed"))
+    item.status = "completed" if finished and work.publication_status != "ongoing" else "reading"
     item.last_read_at = now
     item.updated_at = now
-    latest = max((s.latest_chapter for s in work.sources), default=0)
+    note_progress(item)
+    latest = max((s.latest_chapter for s in visible_sources(item)), default=0)
     if item.has_new_chapter and latest and new >= latest:
         item.has_new_chapter = False  # caught up with the newest chapter
 

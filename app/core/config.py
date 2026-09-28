@@ -34,6 +34,15 @@ class Settings(BaseSettings):
     # "Today" for reading logs and stats (api-contract.md, open point 5).
     app_timezone: str = "Asia/Ho_Chi_Minh"
 
+    # Search across the web (app/providers). Each provider gets this long per search before it is skipped.
+    provider_timeout_seconds: float = 4.0
+    # Sent in the User-Agent to providers (their terms ask for a way to reach the app's maintainer):
+    # a URL or an email address.
+    provider_contact: str = ""
+    search_cache_ttl_hours: int = 6
+    # Vercel Cron calls /api/cron/daily with "Authorization: Bearer <CRON_SECRET>".
+    cron_secret: str = ""
+
     @property
     def cors_origins(self) -> list[str]:
         extra = [o.strip().rstrip("/") for o in self.frontend_url.split(",") if o.strip()]

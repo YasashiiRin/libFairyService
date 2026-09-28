@@ -4,7 +4,7 @@ import re
 from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 ComicStatus = Literal["reading", "completed", "plan_to_read", "on_hold", "dropped"]
 SortOption = Literal["updated_at", "title", "rating", "progress", "relevance", "position"]
@@ -102,12 +102,7 @@ class ComicCreate(_ComicFields):
     shelf_ids: list[str] = Field(default_factory=list)
     has_new_chapter: bool = False
     last_read_at: datetime | None = None
-
-    @model_validator(mode="after")
-    def _progress(self) -> "ComicCreate":
-        if self.current_chapter > self.total_chapters:
-            raise ValueError("Chương đang đọc không thể lớn hơn tổng số chương")
-        return self
+    # current_chapter may be above total_chapters: sites often list new chapters late
 
 
 class ComicUpdate(_ComicFields):

@@ -74,3 +74,27 @@ async def api(db_engine, db_session):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         yield c
     app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def fake_providers():
+    """MangaDex and AniList answered by tests/fake_providers.py (no network), quick timeouts, no pacing."""
+    import httpx
+
+    from app.core.config import get_settings
+    from app.providers import PROVIDERS, http
+    from app.providers.base import RateLimiter
+    from tests.fake_providers import FakeProviders
+
+    fake = FakeProviders()
+    settings = get_settings()
+    old_timeout, old_limiters = settings.provider_timeout_seconds, {n: p.limiter for n, p in PROVIDERS.items()}
+    settings.provider_timeout_seconds = 0.5
+    for provider in PROVIDERS.values():
+        provider.limiter = RateLimiter(per_second=1000)
+    http.transport = httpx.MockTransport(fake.handler)
+    yield fake
+    http.transport = None
+    settings.provider_timeout_seconds = old_timeout
+    for name, provider in PROVIDERS.items():
+        provider.limiter = old_limiters[name]

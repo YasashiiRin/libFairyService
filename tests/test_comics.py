@@ -107,7 +107,7 @@ async def test_create_validation(api, db_session):
     headers = await signed_in(api, db_session)
     for overrides in (
         {"title": "   "},
-        {"current_chapter": 5, "total_chapters": 3},
+        {"current_chapter": -1},
         {"status": "abandoned"},
         {"rating": 6},
         {"tags": ["x" * 61]},
@@ -318,8 +318,10 @@ async def test_update_total_below_progress_clamps(api, db_session):
     comic = await create(api, headers, current_chapter=50, total_chapters=120)
     body = (await api.patch(f"/api/comics/{comic['id']}", json={"total_chapters": 40}, headers=headers)).json()
     assert (body["current_chapter"], body["total_chapters"]) == (40, 40)
+    # progress above the total is kept (providers lag behind releases), not rejected
     res = await api.patch(f"/api/comics/{comic['id']}", json={"current_chapter": 41}, headers=headers)
-    assert res.status_code == 422
+    assert res.status_code == 200
+    assert (res.json()["current_chapter"], res.json()["total_chapters"]) == (41, 40)
 
 
 async def test_update_sources_like_the_detail_page(api, db_session):
@@ -403,8 +405,10 @@ async def test_progress_logs_chapters_read(api, db_session):
     logs = (await db_session.scalars(select(ReadingLog))).all()
     assert [(log.chapters, log.library_item_id) for log in logs] == [(5, uuid.UUID(comic["id"]))]  # 3 + 2, one row per day
 
-    body = (await api.put(path, json={"current_chapter": 999}, headers=headers)).json()
-    assert (body["current_chapter"], body["status"]) == (20, "completed")  # clamped, finished
+    body = (await api.put(path, json={"current_chapter": 20}, headers=headers)).json()
+    assert (body["current_chapter"], body["status"]) == (20, "completed")  # the known total: finished
+    body = (await api.put(path, json={"current_chapter": 23}, headers=headers)).json()
+    assert (body["current_chapter"], body["total_chapters"], body["status"]) == (23, 20, "reading")  # past it: more chapters exist
     body = (await api.put(path, json={"current_chapter": 0}, headers=headers)).json()
     assert (body["current_chapter"], body["status"]) == (0, "reading")
     assert (await api.put(path, json={"current_chapter": -1}, headers=headers)).status_code == 422

@@ -13,11 +13,14 @@ Field names are snake_case on the wire, exactly as in those types.
 - [Auth](#auth)
 - [Users (`/api/users/me`)](#users)
 - [Comics](#comics)
+- [Discover (search across the web)](#discover)
+- [Library (saving)](#library)
 - [Shelves](#shelves)
 - [Sources](#sources)
 - [Tags](#tags)
 - [Stats](#stats)
 - [Notifications](#notifications)
+- [Scheduled jobs](#scheduled-jobs)
 - [Endpoint index](#endpoint-index)
 - [Open points for the backend](#open-points-for-the-backend)
 
@@ -378,6 +381,18 @@ Used by: `/account`.
 
 Service: [`src/services/comicService.ts`](../src/services/comicService.ts).
 
+**How a Comic is stored.** The database keeps each comic once, as a shared **work** (title, authors,
+genres, cover, total chapters, where to read), and one **library item** per user who saved it
+(status, progress, rating, note, favourite, shelves, own tags). A `Comic` joins the two for one
+user; `Comic.id` is the library item's id. Nothing about the web is stored until someone saves it.
+
+- A work found on the web ([Discover](#discover)) is **shared**. A work entered by hand is
+  **private** to the person who entered it. Nobody else can join it.
+- **Editing a work's info** (title, author, description, total, cover, sources) changes the work
+  itself when it is the user's private work or nobody else saved it. When others saved it too, the
+  change is kept as **that user's own version**, and everyone else keeps seeing the shared info.
+  Adding a source always adds it to the shared work, because it only adds information.
+
 ### `Comic`
 
 ```ts
@@ -401,9 +416,12 @@ Source = {
 ```
 
 - `cover_url` is an external `https://` URL, a signed `/api/comics/{id}/cover?v=…&sig=…` URL
-  for an uploaded cover (see [Images](#images)), or `""`.
+  for a stored cover (see [Images](#images)), or `""`.
 - `primary_source_id` is `""` when the comic has no source.
-- `tags` keep the order they were entered in.
+- `tags`: the user's own tags in the order they entered them, then the work's genres.
+- `total_chapters` is the last chapter known (the user's own number, if they set one on a shared
+  work). **`current_chapter` may be higher**, because sites list new chapters before providers do.
+  Clients should cap progress bars at 100 %.
 
 > **Route order:** declare `/api/comics/facets`, `/api/comics/summary` and
 > `/api/comics/lookup` **before** `/api/comics/{id}` in FastAPI.
@@ -513,12 +531,17 @@ Request `ComicCreate`: every `Comic` field except `id`, `created_at` and `update
   spelling wins); 30 tags max, 60 characters each. **Tags that are new for this user are created**,
   and existing ones are reused regardless of case.
 - Unknown fields are rejected (422).
+- A **page link** (with a path, like `https://site/manga/abc`) that a saved work already has
+  attaches the comic to that work. A bare site (`https://cuutruyen.net`) never does.
+  Otherwise a new **private** work is created.
+- `current_chapter` may be above `total_chapters`. It is kept.
 
-Response **201** `Comic`.
+Response **201** `Comic`, or **200** with the user's existing `Comic` if they already saved that work.
+[`POST /api/library`](#post-apilibrary) `{ manual }` does the same.
 
-Errors: **404** `shelf_not_found`; **400** `invalid_file` / **413** `file_too_large` (bad `data:` cover);
-**422** `validation_error` (empty title, `current_chapter > total_chapters`, `rating` outside 0–5,
-a source URL that isn't `http(s)://`, too many tags).
+Errors: **404** `shelf_not_found`; **409** `source_url_taken` (the links belong to two different works);
+**400** `invalid_file` / **413** `file_too_large` (bad `data:` cover); **422** `validation_error`
+(empty title, `rating` outside 0–5, a source URL that isn't `http(s)://`, too many tags).
 
 Used by: `/add`.
 
@@ -533,21 +556,29 @@ Request `ComicUpdate`: any subset of the `ComicCreate` fields. Only the fields s
   `/comics/:id` does to add, edit and remove sources.
 - `primary_source_id` without `sources`: must be one of the comic's sources (**404** `source_not_found`).
 - `tags` and `shelf_ids` replace the whole list. Tags that no comic uses any more are deleted.
-- `total_chapters` below the current chapter pulls `current_chapter` down to it. Sending
-  `current_chapter > total_chapters` is **422**.
+  Genres of the work can't be removed; sending them back again is harmless.
+- `current_chapter` may be above `total_chapters` (kept). Explicitly lowering `total_chapters`
+  below the current chapter pulls `current_chapter` down to it.
 - `cover_url`: a `data:` URL stores a new cover; sending back the comic's own signed cover URL keeps
   it; any other URL (or `""`) replaces it.
+- **On a shared work** that others saved too, `title`, `author`, `description`, `total_chapters` and
+  `cover_url` become the user's own version. Setting the shared value again removes it. For
+  `sources` on a shared work: a removed source is hidden for this user only; a changed site name or
+  chapter link is kept for this user only; a changed link adds the new link to the work and hides
+  the old one for this user; a new source is added to the work.
 
-Response **200** `Comic`.
+Response **200** `Comic`. Never 409 for a shared work.
 
-Errors: **404** `comic_not_found` | `source_not_found` | `shelf_not_found`, **422** `validation_error`.
+Errors: **404** `comic_not_found` | `source_not_found` | `shelf_not_found`, **409** `source_url_taken`
+(a link that belongs to another work), **422** `validation_error`.
 
 Used by: `/comics/:id` (status, rating, note, tags, sources, details).
 
 ### `DELETE /api/comics/{id}`
 
-Response **204**. Also deletes its sources, shelf memberships, reading logs and notifications,
-and tags that no other comic uses.
+Response **204**. Removes the comic from the user's library, with its shelf memberships, reading logs,
+notifications, and tags no other comic uses. The shared work is deleted too once nobody has it
+(its sources and cover with it).
 
 Errors: **404** `comic_not_found`.
 
@@ -569,8 +600,10 @@ Request: `{ "current_chapter": number }`
 
 The server:
 
-- clamps the value to `0..total_chapters`,
-- sets `status` to `completed` when it reaches `total_chapters`, otherwise to `reading`,
+- keeps any value ≥ 0, **including one above `total_chapters`**. When the value is above the work's
+  last known chapter, the server notes it on the work (`latest_chapter_hint`) so the daily check can refresh it,
+- sets `status` to `completed` when it reaches `total_chapters` exactly (unless the work is known to be
+  ongoing), otherwise to `reading`. Past the total means more chapters exist, so it stays `reading`,
 - sets `last_read_at` and `updated_at` to now,
 - when the new chapter is higher, adds the difference to today's `reading_logs` row for this comic
   (one row per comic per day, in `APP_TIMEZONE`, default `Asia/Ho_Chi_Minh`). Going back logs nothing.
@@ -597,6 +630,10 @@ Used by: `/add` (the "add as secondary source" option when the title already exi
 
 Request: any of `site_name`, `url`, `favicon_url`, `chapter_url`, `latest_chapter`, `is_alive`.
 
+On a shared work: `site_name`, `chapter_url` and `favicon_url` become this user's own; a new `url`
+adds that link and hides the old one for this user; a higher `latest_chapter` is noted as a hint;
+`is_alive` is left to the link check.
+
 Response **200** `Comic`.
 
 Errors: **404** `comic_not_found` | `source_not_found`, **422** `validation_error`.
@@ -606,6 +643,7 @@ Used by: not used by the frontend yet (`/comics/:id` edits sources through `PATC
 ### `DELETE /api/comics/{id}/sources/{source_id}`
 
 Response **200** `Comic`. If it was the primary source, the first remaining source becomes primary.
+On a shared work the source is only hidden for this user.
 
 Errors: **404** `comic_not_found` | `source_not_found`.
 
@@ -625,7 +663,7 @@ Used by: not used by the frontend yet (`/comics/:id` sends `PATCH { primary_sour
 
 `PUT`: `multipart/form-data` with the image in `file` (4 MB max). The image is stored in the
 database as a WebP thumbnail that fits 480×720 (never upscaled, EXIF rotation applied, metadata
-dropped). `DELETE` removes the cover.
+dropped). `DELETE` removes the cover. On a shared work it is the user's own cover.
 
 Response **200** `Comic` with the new `cover_url`.
 
@@ -646,6 +684,92 @@ another comic.
 - An unknown id, a wrong signature or an outdated `v` → **404** `not_found`.
 - The URL is relative (`/api/…`). It works as-is when the frontend reaches the API on its own
   origin (the Vite proxy in development, a Vercel rewrite in production).
+
+---
+
+## Discover
+
+Search across the web for comics to save. Service: `src/services/discoverService.ts` (frontend, Part C).
+
+Providers are asked in parallel. Currently MangaDex (its official public API) and AniList (GraphQL,
+used for metadata). Providers give **metadata and links only**: no chapter content is ever
+fetched. Each provider is asked with an identifying `User-Agent`, within its rate limits, and without
+adult content. Their answers are cached for 6 hours (`search_cache`) and never become a catalog:
+a work exists in our database only once someone saves it.
+
+### `GET /api/discover/search?q=&page=`
+
+`q`: 2–100 characters. `page`: 1–10 (default 1; each provider returns up to 20 per page).
+
+Every provider gets about 4 s (`PROVIDER_TIMEOUT_SECONDS`). A slow, failing or rate-limited
+provider is **skipped and listed in `providers_failed`**. The search still answers, with the other
+providers' results.
+
+Response **200**:
+
+```ts
+DiscoverPage = {
+  query: string; page: number;
+  results: DiscoverResult[];
+  providers: string[];          // asked: ["mangadex", "anilist"]
+  providers_failed: string[];   // skipped this time
+}
+DiscoverResult = {
+  provider: string; external_id: string;       // what POST /api/library takes
+  external_ids: Record<string, string>;        // every id known: { mangadex, anilist, mal }
+  providers: string[];                         // every provider that returned it
+  title: string; alt_titles: string[]; description: string;
+  cover_url: string;                           // the provider's image
+  authors: string[]; genres: string[];
+  status: 'ongoing' | 'completed' | 'hiatus' | 'cancelled' | 'unknown';
+  latest_chapter: number | null;               // null = the provider doesn't say
+  links: { site_name: string; url: string }[]; // where to read, one per site
+  in_library: boolean;
+  library_item_id: string | null;              // the user's Comic id when in_library
+}
+```
+
+Duplicates across providers are merged into one result: first by a shared external ID (for example,
+MangaDex knows the AniList ID), then by the same normalised title plus a shared author (name order
+doesn't matter). A merged result is led by MangaDex when it has the work (a reading site first),
+and keeps the rank of its best member. Genres, alternative titles and links are combined.
+
+Errors: **422** `validation_error` (`q` or `page` out of range).
+
+Used by: `/search` ("Khám phá" tab), `/add` ("Tìm theo tên").
+
+---
+
+## Library
+
+### `POST /api/library`
+
+Save a comic. Exactly one of:
+
+| Body | Meaning |
+| --- | --- |
+| `{ "provider": "mangadex", "external_id": "…" }` | a search result |
+| `{ "url": "https://mangadex.org/title/…" }` | a link: a work already saved with that page link, or a provider's own page (MangaDex title, AniList manga) |
+| `{ "manual": ComicCreate }` | entered by hand, like `POST /api/comics` (a private work) |
+
+Optional for the new library item: `status` (default `reading` if `current_chapter` > 0, else
+`plan_to_read`), `current_chapter`, `shelf_ids`.
+
+The server finds the work (by external ID, then by source link) or creates it. When it creates one, it
+fetches the details and cover once (the cover is stored as a WebP thumbnail; if it can't be fetched,
+the provider's link is kept), enriches the details from the other providers that know the work, and
+attaches the work's links as sources. A work others saved only gains what it lacks: IDs, genres,
+alternative titles, a higher chapter. **Idempotent**: saving a work the user already has returns
+their existing item.
+
+Response **201** `Comic`, or **200** with the user's existing `Comic`.
+
+Errors: **404** `work_not_found` (the provider doesn't know that ID) | `shelf_not_found`;
+**422** `unknown_provider` | `link_not_supported` (a link we can't read: search by name or enter it
+by hand) | `validation_error` (none or several of the three ways); **503** `provider_unavailable`
+(the provider is down; nothing was saved).
+
+Used by: `/search` ("Thêm vào tủ"), `/add`.
 
 ---
 
@@ -898,6 +1022,25 @@ Used by: `/notifications` (swipe or delete button).
 
 ---
 
+## Scheduled jobs
+
+### `GET /api/cron/daily`
+
+Called by Vercel Cron once a day at 20:00 UTC (03:00 in Vietnam; see `vercel.json`) with
+`Authorization: Bearer <CRON_SECRET>`. Idempotent and quick. It:
+
+- deletes expired `search_cache` rows,
+- deletes works nobody has in their library any more (after an account is deleted).
+
+Coming next: refreshing `latest_chapter` from the providers for works where a reader got further
+(`latest_chapter_hint`), and checking source links.
+
+Response **200** `{ "search_cache_deleted": number, "orphan_works_deleted": number }`.
+
+Errors: **401** `not_authenticated` (wrong secret), **503** `cron_not_configured` (no `CRON_SECRET`).
+
+---
+
 ## Endpoint index
 
 | Method   | Path                                         | Service function                           | Used by                                   |
@@ -937,6 +1080,9 @@ Used by: `/notifications` (swipe or delete button).
 | DELETE   | `/api/comics/{id}/cover`                     | —                                          | not used yet                              |
 | GET      | `/api/comics/{id}/cover?v=&sig=`             | (`<img src>` of `cover_url`)               | every page with covers                    |
 | GET      | `/api/users/{id}/avatar?v=&sig=`             | (`<img src>` of `avatar_url`)              | header, `/account`                        |
+| GET      | `/api/discover/search`                       | `discoverService.search`                   | `/search` (Khám phá), `/add`              |
+| POST     | `/api/library`                               | `discoverService.addToLibrary`             | `/search` (Khám phá), `/add`              |
+| GET      | `/api/cron/daily`                            | — (Vercel Cron)                            | —                                         |
 | GET      | `/api/shelves`                               | `shelvesService.list`                      | `/`, `/add`, `/comics/:id`, `/shelves/:id`|
 | GET      | `/api/shelves/{id}`                          | `shelvesService.getShelfById`              | `/shelves/:id`                            |
 | POST     | `/api/shelves`                               | `shelvesService.create`                    | shelf form (`/`, `/shelves/:id`)          |
