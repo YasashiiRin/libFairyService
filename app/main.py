@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import auth, health, users
+from app.api.routes import auth, comics, health, media, tags, users
 from app.core.config import get_settings
 from app.core.errors import install_error_handlers
 
@@ -29,6 +29,9 @@ def create_app() -> FastAPI:
     app.include_router(health.router, prefix="/api")
     app.include_router(auth.router, prefix="/api")
     app.include_router(users.router, prefix="/api")
+    app.include_router(comics.router, prefix="/api")
+    app.include_router(tags.router, prefix="/api")
+    app.include_router(media.router, prefix="/api")
     return app
 
 

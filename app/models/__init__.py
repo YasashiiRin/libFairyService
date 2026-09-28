@@ -2,24 +2,26 @@
 
 from app.models.auth import PasswordResetToken, RefreshToken
 from app.models.base import Base
-from app.models.comic import Comic, ComicTag, Source, Tag
+from app.models.library import LibraryItem, LibraryItemTag, Tag
 from app.models.notification import Notification
 from app.models.reading import ReadingGoal, ReadingLog
-from app.models.shelf import Shelf, ShelfComic
+from app.models.shelf import Shelf, ShelfItem
 from app.models.user import User
+from app.models.work import Work, WorkSource
 
 __all__ = [
     "Base",
-    "Comic",
-    "ComicTag",
+    "LibraryItem",
+    "LibraryItemTag",
     "Notification",
     "PasswordResetToken",
     "ReadingGoal",
     "ReadingLog",
     "RefreshToken",
     "Shelf",
-    "ShelfComic",
-    "Source",
+    "ShelfItem",
     "Tag",
     "User",
+    "Work",
+    "WorkSource",
 ]

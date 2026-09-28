@@ -6,6 +6,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 from app.models.user import DEFAULT_SETTINGS, User
+from app.services.images import media_url
 
 DISPLAY_NAME_MAX = 40  # ProfileSection NAME_MAX
 BIO_MAX = 160  # ProfileSection BIO_MAX
@@ -58,8 +59,7 @@ class UserOut(BaseModel):
             email=user.email,
             display_name=user.display_name,
             bio=user.bio,
-            # Avatar upload/serving (PUT /api/users/me/avatar) comes with the profile picture work.
-            avatar_url="",
+            avatar_url=media_url("avatar", user.id, user.avatar_updated_at) if user.avatar_updated_at else "",
             role=user.role,  # type: ignore[arg-type]
             created_at=user.created_at,
             last_backup_at=user.last_backup_at,
@@ -73,12 +73,16 @@ def _trimmed(value: str) -> str:
 
 
 class ProfileUpdate(BaseModel):
-    """PATCH /api/users/me"""
+    """PATCH /api/users/me: display_name, bio, avatar and settings only. Other fields (username, email,
+    role, …) are collected rather than dropped, so the route can refuse them with a clear error."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
     display_name: str | None = Field(default=None, max_length=DISPLAY_NAME_MAX)
     bio: str | None = Field(default=None, max_length=BIO_MAX)
+    # a data:image/…;base64 URL to upload a new picture, or null to remove it
+    avatar: str | None = Field(default=None, max_length=6_000_000)
+    settings: UserSettingsUpdate | None = None
 
     @field_validator("display_name", "bio", mode="before")
     @classmethod

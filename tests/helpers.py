@@ -49,3 +49,25 @@ def bearer(token: str) -> dict[str, str]:
 
 def expired_access_token(user_id, session_id) -> str:
     return create_access_token(user_id, session_id, now=datetime.now(UTC) - timedelta(hours=1))
+
+
+async def signed_in(api, db: AsyncSession, username: str = "bemeolac") -> dict[str, str]:
+    """Create a user, log in, return the Authorization header."""
+    await make_user(db, username)
+    return bearer((await login(api, username))["access_token"])
+
+
+def png_bytes(width: int = 1200, height: int = 1800, color=(200, 120, 160)) -> bytes:
+    import io
+
+    from PIL import Image
+
+    out = io.BytesIO()
+    Image.new("RGB", (width, height), color).save(out, "PNG")
+    return out.getvalue()
+
+
+def data_url(raw: bytes, mime: str = "image/png") -> str:
+    import base64
+
+    return f"data:{mime};base64," + base64.b64encode(raw).decode()

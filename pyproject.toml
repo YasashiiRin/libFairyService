@@ -9,9 +9,12 @@ dependencies = [
     "asyncpg>=0.31.0",
     "email-validator>=2.3.0",
     "fastapi>=0.141.1",
+    "pillow>=12.3.0",
     "pydantic-settings>=2.15.0",
     "pyjwt>=2.15.0",
+    "python-multipart>=0.0.32",
     "sqlalchemy[asyncio]>=2.0",
+    "tzdata>=2026.4",
 ]
 
 [dependency-groups]

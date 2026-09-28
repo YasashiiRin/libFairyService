@@ -20,8 +20,9 @@ class Notification(Base):
 
     id: Mapped[uuid.UUID] = uuid_pk()
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    # comic_title / comic_cover_url in the API come from this comic; deleting the comic deletes its notifications
-    comic_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("comics.id", ondelete="CASCADE"), nullable=True)
+    # the API's comic_id / comic_title / comic_cover_url come from this library item (and its work);
+    # removing the item from the library deletes its notifications
+    library_item_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("library_items.id", ondelete="CASCADE"), nullable=True)
     type: Mapped[str] = mapped_column(String(16), nullable=False)
     message: Mapped[str] = mapped_column(Text, nullable=False)
     is_read: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")

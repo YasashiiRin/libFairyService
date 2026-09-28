@@ -27,12 +27,14 @@ class Shelf(Base):
     updated_at: Mapped[datetime] = updated_at_column()
 
 
-class ShelfComic(Base):
-    __tablename__ = "shelf_comics"
-    __table_args__ = (Index("ix_shelf_comics_comic_id", "comic_id"),)
+class ShelfItem(Base):
+    """A library item on a shelf."""
+
+    __tablename__ = "shelf_items"
+    __table_args__ = (Index("ix_shelf_items_library_item_id", "library_item_id"),)
 
     shelf_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("shelves.id", ondelete="CASCADE"), primary_key=True)
-    comic_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("comics.id", ondelete="CASCADE"), primary_key=True)
+    library_item_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("library_items.id", ondelete="CASCADE"), primary_key=True)
     # PUT /api/shelves/{id}/order; NULL = not in the saved order (listed after the ordered ones)
     position: Mapped[int | None] = mapped_column(Integer, nullable=True)
     added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

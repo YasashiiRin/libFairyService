@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     refresh_token_ttl_days: int = 30
     password_reset_ttl_minutes: int = 30
 
+    # "Today" for reading logs and stats (api-contract.md, open point 5).
+    app_timezone: str = "Asia/Ho_Chi_Minh"
+
     @property
     def cors_origins(self) -> list[str]:
         extra = [o.strip().rstrip("/") for o in self.frontend_url.split(",") if o.strip()]

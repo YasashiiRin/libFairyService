@@ -16,8 +16,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import SessionLocal
 from app.core.security import hash_password
-from app.models import Comic, ComicTag, Notification, ReadingGoal, ReadingLog, Shelf, ShelfComic, Source, Tag, User
+from app.models import LibraryItem, LibraryItemTag, Notification, ReadingGoal, ReadingLog, Shelf, ShelfItem, Tag, User, Work, WorkSource
 from app.models.user import default_settings
+from app.services.urls import normalize_url
 
 USERNAME = "bemeolac"
 PASSWORD = "12012007"
@@ -213,82 +214,99 @@ async def seed(session: AsyncSession, *, reset: bool = False) -> str:
     session.add_all(tags.values())
     await session.flush()
 
-    comics: list[Comic] = []
+    items: list[LibraryItem] = []
     for spec in COMICS:
         added = now - timedelta(days=spec.added_days_ago)
         last_read = None if spec.read_days_ago is None else now - timedelta(days=spec.read_days_ago, hours=2)
-        comic = Comic(
+        # a seeded comic has links, so it is a shared work (like the migrated ones)
+        work = await session.scalar(
+            select(Work).join(WorkSource).where(WorkSource.url == normalize_url(spec.sources[0].url), WorkSource.private_owner_id.is_(None))
+        )
+        if work is None:
+            work = Work(
+                title=spec.title,
+                authors=[spec.author],
+                alt_titles=[],
+                genres=[],
+                external_ids={},
+                description=spec.description,
+                cover_url=spec.cover_url,
+                latest_chapter=spec.total_chapters,
+                created_at=added,
+                sources=[
+                    WorkSource(
+                        position=i,
+                        site_name=s.site_name,
+                        url=normalize_url(s.url),
+                        favicon_url=s.favicon_url,
+                        chapter_url=normalize_url(s.url),
+                        latest_chapter=s.latest_chapter,
+                        is_alive=s.is_alive,
+                        last_checked_at=now - timedelta(hours=6),
+                        added_by_user_id=user.id,
+                    )
+                    for i, s in enumerate(spec.sources)
+                ],
+            )
+            session.add(work)
+            await session.flush()
+        else:
+            await session.refresh(work, ["sources"])
+        item = LibraryItem(
             user_id=user.id,
-            title=spec.title,
-            author=spec.author,
-            description=spec.description,
-            cover_url=spec.cover_url,
+            work=work,
             status=spec.status,
             current_chapter=spec.current_chapter,
-            total_chapters=spec.total_chapters,
             rating=spec.rating,
             is_favorite=spec.is_favorite,
             note=spec.note,
             has_new_chapter=spec.has_new_chapter,
+            primary_source_id=work.sources[0].id,
             last_read_at=last_read,
             created_at=added,
             updated_at=last_read or added,
-            sources=[
-                Source(
-                    position=i,
-                    site_name=s.site_name,
-                    url=s.url,
-                    favicon_url=s.favicon_url,
-                    chapter_url=s.url,
-                    latest_chapter=s.latest_chapter,
-                    is_alive=s.is_alive,
-                    last_checked_at=now - timedelta(hours=6),
-                )
-                for i, s in enumerate(spec.sources)
-            ],
-            tag_links=[ComicTag(tag=tags[name], position=i) for i, name in enumerate(spec.tags)],
+            tag_links=[LibraryItemTag(tag=tags[name], position=i) for i, name in enumerate(spec.tags)],
         )
-        session.add(comic)
-        comics.append(comic)
+        session.add(item)
+        items.append(item)
     await session.flush()
 
-    for spec, comic in zip(COMICS, comics, strict=True):
-        comic.primary_source_id = comic.sources[0].id
+    for spec, item in zip(COMICS, items, strict=True):
         for key in spec.shelves:
-            session.add(ShelfComic(shelf_id=shelves[key].id, comic_id=comic.id, position=None))
+            session.add(ShelfItem(shelf_id=shelves[key].id, library_item_id=item.id, position=None))
         for n, days_ago in enumerate(spec.reading_days):
             day: date = today - timedelta(days=days_ago)
-            session.add(ReadingLog(user_id=user.id, comic_id=comic.id, day=day, chapters=1 + (n * 7 + days_ago) % 4))
+            session.add(ReadingLog(user_id=user.id, library_item_id=item.id, day=day, chapters=1 + (n * 7 + days_ago) % 4))
 
     session.add(ReadingGoal(user_id=user.id, year=today.year, target=12))
 
-    by_title = {c.title: c for c in comics}
+    by_title = {spec.title: item for spec, item in zip(COMICS, items, strict=True)}
     session.add_all(
         [
             Notification(
                 user_id=user.id,
-                comic_id=by_title["Tiệm Tạp Hóa Thời Gian"].id,
+                library_item_id=by_title["Tiệm Tạp Hóa Thời Gian"].id,
                 type="new_chapter",
                 message="Chương 47 vừa nở hoa trên Cuutruyen 🌸",
                 created_at=now - timedelta(hours=3),
             ),
             Notification(
                 user_id=user.id,
-                comic_id=by_title["Lữ Khách Phương Xa"].id,
+                library_item_id=by_title["Lữ Khách Phương Xa"].id,
                 type="new_chapter",
                 message="Chương 34 đã có trên Bilibili",
                 created_at=now - timedelta(days=1),
             ),
             Notification(
                 user_id=user.id,
-                comic_id=by_title["Thư Viện Những Vì Sao Đêm"].id,
+                library_item_id=by_title["Thư Viện Những Vì Sao Đêm"].id,
                 type="broken_link",
                 message="Liên kết Hako không mở được nữa, nàng xem lại giúp nhé 🍂",
                 created_at=now - timedelta(days=2),
             ),
             Notification(
                 user_id=user.id,
-                comic_id=by_title["Khu Vườn Phù Thủy Bí Mật"].id,
+                library_item_id=by_title["Khu Vườn Phù Thủy Bí Mật"].id,
                 type="new_chapter",
                 message="Truyện đã có chương ngoại truyện",
                 is_read=True,
@@ -297,7 +315,7 @@ async def seed(session: AsyncSession, *, reset: bool = False) -> str:
         ]
     )
     await session.commit()
-    return f'Đã tạo tài khoản "{USERNAME}" với {len(shelves)} kệ, {len(comics)} truyện, {len(tags)} thẻ.'
+    return f'Đã tạo tài khoản "{USERNAME}" với {len(shelves)} kệ, {len(items)} truyện, {len(tags)} thẻ.'
 
 
 async def main() -> None:
