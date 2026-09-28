@@ -33,13 +33,15 @@ Field names are snake_case on the wire, exactly as in those types.
 
 ### Authentication
 
-- Every endpoint except `POST /api/auth/login` and `POST /api/auth/refresh` requires
-  `Authorization: Bearer <access_token>`.
+- Every endpoint except `POST /api/auth/register`, `/login`, `/refresh`, `/forgot-password`
+  and `/reset-password` requires `Authorization: Bearer <access_token>`.
 - A missing, expired or invalid access token → **401**. The frontend then calls
   `POST /api/auth/refresh` **once** and retries the original request. If the refresh
   fails too, it clears the session and redirects to `/login`.
-- Concurrent 401s share a single refresh attempt, so the refresh endpoint can rotate
-  the refresh token safely.
+- Concurrent 401s share a single refresh attempt within one tab. Several tabs share the
+  same refresh token, so the server does **not** rotate it (rotating would sign the other
+  tabs out). Each device has one session. Revoking the session signs that device out at
+  once, because every request checks it.
 
 ### Request and response bodies
 
@@ -92,6 +94,8 @@ Common error codes, used on every endpoint where they apply:
 | ------ | ------------------ | ---------------------------------------------------------- |
 | 401    | `not_authenticated`| Missing or invalid access token (triggers the refresh flow). |
 | 401    | `token_expired`    | Access token expired (triggers the refresh flow).          |
+| 401    | `session_revoked`  | This device was signed out (logout, "sign out other devices", password change or reset). The refresh then fails too, so the client logs out. |
+| 403    | `account_locked`   | The account is locked (`is_active = false`). The client does not log out, but it can't use the API. |
 | 404    | `comic_not_found`  | Unknown comic ID (or one that belongs to another user).    |
 | 404    | `shelf_not_found`  | Unknown shelf ID.                                          |
 | 404    | `not_found`        | Any other unknown resource.                                |
@@ -141,10 +145,67 @@ Response **200** `LoginResult`:
 }
 ```
 
-Errors: **401** `invalid_credentials` (wrong username/email or password; don't reveal which one).
-This 401 does not trigger the refresh flow.
+Errors:
+
+- **401** `invalid_credentials`: wrong username/email or password (the response doesn't reveal which).
+  This 401 does not trigger the refresh flow.
+- **403** `account_locked`: the password is right but the account is locked. `detail`:
+  "Tài khoản của nàng đang tạm bị khóa. Nàng liên hệ quản trị viên để được mở lại nhé."
+  A wrong password on a locked account still gets `invalid_credentials`.
 
 Used by: `/login`.
+
+### `POST /api/auth/register`
+
+No auth header. Creates an account and signs it in.
+
+Request:
+
+```json
+{ "username": "tiennu", "email": "tiennu@example.com", "password": "••••••••", "display_name": "Tiên Nữ" }
+```
+
+- `username`: 3–32 characters from `a-z 0-9 _ .`. It is stored in lowercase.
+- `email` is stored in lowercase.
+- `password`: 8–128 characters.
+- `display_name` is optional, 40 characters max. Default: the username.
+
+Response **201** `LoginResult`, as for login.
+
+Errors: **409** `username_taken`, **409** `email_taken`, **422** `validation_error`.
+
+Used by: not used by the frontend yet (there is no sign-up page).
+
+### `POST /api/auth/forgot-password`
+
+No auth header.
+
+Request: `{ "email": "…" }`
+
+Response **202** `{ "detail": "Nếu email này có tài khoản, …" }`. The response is the same
+whether or not the email has an account, so it can't be used to find accounts.
+
+- For an active account, it creates a single-use reset token valid for
+  `PASSWORD_RESET_TTL_MINUTES` (default 30). Older unused links stop working.
+- The link is `{FRONTEND_URL}/reset-password?token=…`. **For now it is printed to the server
+  log**; email comes later.
+
+Errors: **422** `validation_error` (not an email).
+
+Used by: not used by the frontend yet (there is no reset page).
+
+### `POST /api/auth/reset-password`
+
+No auth header.
+
+Request: `{ "token": "…", "new_password": "…" }` (8–128 characters).
+
+Response **204**. Sets the new password and signs out **every** device.
+
+Errors: **400** `invalid_reset_token` (unknown, used or expired), **403** `account_locked`,
+**422** `validation_error`.
+
+Used by: not used by the frontend yet.
 
 ### `POST /api/auth/refresh`
 
@@ -152,16 +213,21 @@ No auth header.
 
 Request: `{ "refresh_token": "…" }`
 
-Response **200**: `{ "access_token": "…", "refresh_token": "…" }`. `refresh_token`
-is optional: if you leave it out, the client keeps the old one. Rotating it is recommended.
+Response **200**: `{ "access_token": "…", "token_type": "bearer" }`. The refresh token is not rotated:
+the client keeps the one it has (`SessionTokens.refresh_token` is optional). Each refresh moves
+the session's expiry to `REFRESH_TOKEN_TTL_DAYS` (default 30) from now, so the expiry slides
+while the device is in use.
 
-Errors: **401** `invalid_refresh_token` (expired, revoked or unknown). The client then logs out.
+Errors: **401** `invalid_refresh_token` (expired, revoked or unknown), **403** `account_locked`.
+The client logs out on either.
 
 Used by: the HTTP client, automatically, after any 401.
 
 ### `POST /api/auth/logout`
 
-Request: `{ "refresh_token": "…" }`. Revokes this device's session only.
+Request: `{ "refresh_token": "…" }`. Revokes this device's session only. The body is optional:
+without it, the session of the access token is revoked. A refresh token that belongs to
+another user is ignored.
 
 Response **204**.
 
@@ -234,10 +300,10 @@ Used by: `/account/appearance` and the theme toggle in the header (`theme`,
 
 Request: `{ "current_password": "…", "new_password": "…" }`
 
-Response **204**.
+Response **204**. Every **other** device is signed out; this one stays signed in.
 
 Errors: **400** `wrong_password` (the UI shows it under the "current password" field),
-**422** `validation_error` (the new password is too weak).
+**422** `validation_error` (the new password is shorter than 8 characters, or the same as the current one).
 
 Used by: `/account/security`.
 
@@ -741,6 +807,9 @@ Used by: `/notifications` (swipe or delete button).
 | POST     | `/api/auth/login`                            | `authService.login`                        | `/login`                                  |
 | POST     | `/api/auth/refresh`                          | `http.ts` (automatic)                      | every page, after a 401                   |
 | POST     | `/api/auth/logout`                           | `authService.logout`                       | avatar menu, `/account`                   |
+| POST     | `/api/auth/register`                         | —                                          | not used yet                              |
+| POST     | `/api/auth/forgot-password`                  | —                                          | not used yet                              |
+| POST     | `/api/auth/reset-password`                   | —                                          | not used yet                              |
 | GET      | `/api/users/me`                              | `userService.getCurrentUser`               | app start-up, `/account/data`             |
 | PATCH    | `/api/users/me`                              | `userService.updateProfile`                | `/account/profile`                        |
 | PUT      | `/api/users/me/avatar`                       | `userService.uploadAvatar`                 | `/account/profile`                        |
@@ -794,8 +863,8 @@ These are decisions the frontend doesn't make. Settle them when you build the AP
    `POST /api/comics/{id}/cover` (multipart, like the avatar) and switch the page to it.
 2. **CORS.** Allow the Vercel origin(s) and `http://localhost:3000`, with the headers
    `Authorization` and `Content-Type`, and expose `Content-Disposition`.
-3. **Token lifetimes.** The client only needs the access token to fail with 401 once
-   it expires. Suggested: 15 minutes for the access token, 30 days for the refresh token, rotated on refresh.
+3. **Token lifetimes.** *Decided:* 15 minutes for the access token, and 30 days (sliding) for the
+   refresh token, which is not rotated (see [Authentication](#authentication)).
 4. **New chapters and broken links.** Something has to set `has_new_chapter`,
    `Source.latest_chapter` and `Source.is_alive`, and create `new_chapter` and `broken_link`
    notifications. That could be a scheduled job that honours

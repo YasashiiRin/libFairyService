@@ -12,7 +12,6 @@ from sqlalchemy import (
     LargeBinary,
     String,
     Text,
-    Uuid,
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
