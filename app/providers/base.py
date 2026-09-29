@@ -102,6 +102,11 @@ class Provider:
         details = await self.get_details(external_id)
         return details.latest_chapter if details else None
 
+    @classmethod
+    def page_url(cls, external_id: str) -> str:
+        """The work's own page on the provider (where an attribution badge links to)."""
+        raise NotImplementedError
+
     async def _send(self, method: str, url: str, **kwargs) -> httpx.Response:
         await self.limiter.wait()
         try:

@@ -23,7 +23,9 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import Select, all_, and_, bindparam, case, delete, exists, false, func, literal, or_, select, text
 from sqlalchemy.dialects.postgresql import ARRAY, insert
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import aliased, selectinload
+from sqlalchemy import inspect
+from sqlalchemy.orm import aliased, contains_eager, joinedload, selectinload
+from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.types import Text
 
@@ -125,7 +127,8 @@ def cover_url_of(item: LibraryItem) -> str:
 
 def visible_sources(item: LibraryItem) -> list[WorkSource]:
     hidden = set(item.hidden_source_ids or [])
-    return [s for s in item.work.sources if s.id not in hidden]
+    # sorted here, not only by the query: objects changed in this request keep their memory order
+    return sorted((s for s in item.work.sources if s.id not in hidden), key=lambda s: s.position)
 
 
 def source_out(s: WorkSource, override: dict[str, Any] | None = None) -> SourceOut:
@@ -172,7 +175,7 @@ def comic_out(item: LibraryItem) -> ComicOut:
         rating=item.rating,
         is_favorite=item.is_favorite,
         note=item.note,
-        tags=merge_tags([link.tag.name for link in item.tag_links], item.work.genres),
+        tags=merge_tags([link.tag.name for link in sorted(item.tag_links, key=lambda tl: tl.position)], item.work.genres),
         sources=[source_out(s, overrides.get(str(s.id))) for s in visible_sources(item)],
         primary_source_id=str(primary.id) if primary else "",
         shelf_ids=[ALL_SHELF, *(str(link.shelf_id) for link in sorted(item.shelf_links, key=lambda sl: sl.added_at))],
@@ -186,12 +189,26 @@ def comic_out(item: LibraryItem) -> ComicOut:
 # ── Loading ──────────────────────────────────────────────────────────────
 
 
-def with_relations(stmt: Select) -> Select:
-    return stmt.options(
-        selectinload(LibraryItem.work).selectinload(Work.sources),
-        selectinload(LibraryItem.tag_links).joinedload(LibraryItemTag.tag),
-        selectinload(LibraryItem.shelf_links),
+# the item's own relations (its tags and shelves)
+ITEM_RELATIONS = (selectinload(LibraryItem.tag_links).joinedload(LibraryItemTag.tag), selectinload(LibraryItem.shelf_links))
+
+
+async def item_for_work(db: AsyncSession, user_id: uuid.UUID, work: Work) -> LibraryItem | None:
+    """The user's item for a work already loaded with its sources: only the item's own tags and
+    shelves are fetched, and the item is given that work (no second read of it)."""
+    item = await db.scalar(
+        select(LibraryItem).where(LibraryItem.user_id == user_id, LibraryItem.work_id == work.id).options(*ITEM_RELATIONS)
     )
+    if item is not None:
+        set_committed_value(item, "work", work)
+    return item
+
+
+def with_relations(stmt: Select, *, work_joined: bool = False) -> Select:
+    """Everything comic_out needs: the item and its work in one query (joined), then its sources,
+    tags and shelves (one query each, for every item at once). `work_joined`: stmt already joins Work."""
+    work = contains_eager(LibraryItem.work) if work_joined else joinedload(LibraryItem.work, innerjoin=True)
+    return stmt.options(work.selectinload(Work.sources), *ITEM_RELATIONS)
 
 
 async def get_comic(db: AsyncSession, user_id: uuid.UUID, comic_id: str) -> LibraryItem:
@@ -204,9 +221,29 @@ async def get_comic(db: AsyncSession, user_id: uuid.UUID, comic_id: str) -> Libr
     return item
 
 
+def _loaded(obj: Any, *relations: str) -> bool:
+    """Every column (deferred ones aside) and the given relationships are in memory."""
+    state = inspect(obj)
+    needed = {p.key for p in state.mapper.column_attrs if not p.deferred} | set(relations)
+    return not (state.unloaded & needed)
+
+
+def ready_for_output(item: LibraryItem) -> bool:
+    if not _loaded(item, "work", "tag_links", "shelf_links") or not _loaded(item.work, "sources"):
+        return False
+    return (
+        all(_loaded(s) for s in item.work.sources)
+        and all(_loaded(tl, "tag") and _loaded(tl.tag) for tl in item.tag_links)
+        and all(_loaded(sl) for sl in item.shelf_links)
+    )
+
+
 async def reload(db: AsyncSession, item: LibraryItem) -> LibraryItem:
-    """Fresh copy with relations, after changes (server defaults and orderings applied)."""
+    """The item ready for comic_out after changes. Flushing returns server-generated values
+    (eager_defaults), so it is normally used as it is; anything left unloaded is fetched again."""
     await db.flush()
+    if ready_for_output(item):
+        return item
     return await db.scalar(
         with_relations(select(LibraryItem).where(LibraryItem.id == item.id)).execution_options(populate_existing=True)
     )
@@ -365,7 +402,6 @@ async def list_comics(
     db: AsyncSession, user_id: uuid.UUID, f: ListFilters, sort: SortOption | None, page: int, page_size: int
 ) -> tuple[list[LibraryItem], int]:
     base = select(LibraryItem).join(Work, Work.id == LibraryItem.work_id).where(*_conditions(user_id, f))
-    total = await db.scalar(select(func.count()).select_from(base.subquery())) or 0
 
     sort = sort or ("relevance" if f.q else "updated_at")
     stmt = base
@@ -388,10 +424,24 @@ async def list_comics(
     else:
         order = [newest]
 
-    rows = await db.scalars(
-        with_relations(stmt.order_by(*order, LibraryItem.id).limit(page_size).offset((page - 1) * page_size))
-    )
-    return list(rows), total
+    # the total comes with the page (a window count over every match), not from a second query
+    rows = (
+        await db.execute(
+            with_relations(
+                stmt.add_columns(func.count().over().label("total"))
+                .order_by(*order, LibraryItem.id)
+                .limit(page_size)
+                .offset((page - 1) * page_size),
+                work_joined=True,
+            )
+        )
+    ).all()
+    if rows:
+        return [item for item, _ in rows], rows[0].total
+    if page == 1:
+        return [], 0
+    # past the last page: only the total is left to find
+    return [], await db.scalar(select(func.count()).select_from(base.subquery())) or 0
 
 
 async def summary(db: AsyncSession, user_id: uuid.UUID) -> dict:
@@ -851,16 +901,27 @@ async def upload_cover(db: AsyncSession, item: LibraryItem, webp: bytes) -> Libr
 # ── Create / update / delete ─────────────────────────────────────────────
 
 
-async def _work_with_links(db: AsyncSession, user_id: uuid.UUID, urls: list[str]) -> Work | None:
+async def work_with_links(db: AsyncSession, user_id: uuid.UUID, urls: list[str]) -> Work | None:
     """A shared work (or one of the user's own private works) that already has one of these links."""
-    work_ids = set()
-    for url in urls:
-        src = await find_source_by_url(db, url, None) or await find_source_by_url(db, url, user_id)
-        if src is not None:
-            work_ids.add(src.work_id)
-    if len(work_ids) > 1:
+    page_links = [u for u in dict.fromkeys(urls) if identifies_work(u)]  # a bare site link identifies nothing
+    if not page_links:
+        return None
+    # every link at once, the work and its sources in the same trip (two queries, not two per link)
+    has_link = exists().where(
+        WorkSource.work_id == Work.id,
+        WorkSource.url.in_(page_links),
+        or_(WorkSource.private_owner_id.is_(None), WorkSource.private_owner_id == user_id),
+    )
+    works = list(await db.scalars(select(Work).where(has_link).options(selectinload(Work.sources))))
+    found: set[uuid.UUID] = set()
+    for url in page_links:  # each link: the shared work that has it, else the user's private one
+        having = [w for w in works if any(src.url == url for src in w.sources)]
+        pick = next((w for w in having if w.owner_user_id is None), None) or next(iter(having), None)
+        if pick is not None:
+            found.add(pick.id)
+    if len(found) > 1:
         raise source_url_taken()  # the links belong to different works
-    return await db.get(Work, work_ids.pop()) if work_ids else None
+    return next((w for w in works if w.id in found), None)
 
 
 async def create_comic(db: AsyncSession, user_id: uuid.UUID, data: ComicCreate) -> tuple[LibraryItem, bool]:
@@ -869,18 +930,15 @@ async def create_comic(db: AsyncSession, user_id: uuid.UUID, data: ComicCreate) 
     A link that a saved work already has attaches the comic to that work; if the user already has
     that work, their existing item comes back unchanged. Otherwise a new private work is created.
     """
-    work = await _work_with_links(db, user_id, [normalize_url(s.url) for s in data.sources])
+    work = await work_with_links(db, user_id, [normalize_url(s.url) for s in data.sources])
     joined = work is not None
     if joined:
-        mine = await db.scalar(
-            with_relations(select(LibraryItem).where(LibraryItem.user_id == user_id, LibraryItem.work_id == work.id))
-        )
+        mine = await item_for_work(db, user_id, work)
         if mine is not None:
             return mine, False
         # joining a work others saved: add what it lacks, never overwrite what it has
         if data.title != work.title and data.title not in work.alt_titles:
             work.alt_titles = [*work.alt_titles, data.title]
-        await db.refresh(work, ["sources"])
     else:
         work = Work(
             title=data.title,
@@ -893,8 +951,7 @@ async def create_comic(db: AsyncSession, user_id: uuid.UUID, data: ComicCreate) 
             owner_user_id=user_id,  # entered by hand: private to its creator
             sources=[],
         )
-        db.add(work)
-        await db.flush()
+        db.add(work)  # inserted with the item below
         change = _cover_change(data.cover_url, None)
         if change:
             set_work_cover(work, change)

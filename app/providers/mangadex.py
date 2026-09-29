@@ -97,6 +97,10 @@ class MangaDex(Provider):
     label = "MangaDex"
     limiter = RateLimiter(per_second=5)
 
+    @classmethod
+    def page_url(cls, external_id: str) -> str:
+        return f"{SITE}/{external_id}"
+
     async def _get(self, path: str, params: list[tuple[str, Any]]) -> dict[str, Any]:
         res = await self._send("GET", f"{API}{path}", params=params)
         if res.status_code == 404:

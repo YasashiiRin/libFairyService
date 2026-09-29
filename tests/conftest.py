@@ -17,7 +17,9 @@ from httpx import ASGITransport, AsyncClient  # noqa: E402
 from sqlalchemy import text  # noqa: E402
 from sqlalchemy.ext.asyncio import async_sessionmaker  # noqa: E402
 
-from app.core.db import create_engine, get_session  # noqa: E402
+from fastapi import Request  # noqa: E402
+
+from app.core.db import create_engine, get_session, uses_autocommit  # noqa: E402
 from app.main import app  # noqa: E402
 
 
@@ -29,7 +31,7 @@ async def client():
 
 
 def alembic(*args: str) -> subprocess.CompletedProcess:
-    env = {**os.environ, "DATABASE_URL_DIRECT": TEST_DATABASE_URL or ""}
+    env = {**os.environ, "DATABASE_URL_UNPOOLED": TEST_DATABASE_URL or ""}
     return subprocess.run([sys.executable, "-m", "alembic", *args], env=env, capture_output=True, text=True, check=False)
 
 
@@ -65,9 +67,10 @@ async def db_session(db_engine):
 async def api(db_engine, db_session):
     """An HTTP client for the app, on the test database (tables are emptied after each test)."""
     sessions = async_sessionmaker(db_engine, expire_on_commit=False)
+    autocommit = async_sessionmaker(db_engine.execution_options(isolation_level="AUTOCOMMIT"), expire_on_commit=False)
 
-    async def test_session():
-        async with sessions() as session:
+    async def test_session(request: Request):  # the same rule as get_session
+        async with (autocommit if uses_autocommit(request) else sessions)() as session:
             yield session
 
     app.dependency_overrides[get_session] = test_session

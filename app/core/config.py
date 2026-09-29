@@ -2,7 +2,7 @@
 
 from functools import lru_cache
 
-from pydantic import AliasChoices, Field
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # The frontend's dev server. Vite's default port is 5173; BeMeoLac runs on 3000.
@@ -16,10 +16,11 @@ class Settings(BaseSettings):
 
     # Neon pooled connection (used by the app).
     database_url: str
-    # Neon direct connection (used by Alembic). Neon writes it as DATABASE_URL_UNPOOLED.
-    database_url_direct: str | None = Field(
-        default=None, validation_alias=AliasChoices("DATABASE_URL_DIRECT", "DATABASE_URL_UNPOOLED")
-    )
+    # Neon direct (non-pooled) connection, used by Alembic migrations: DATABASE_URL_UNPOOLED.
+    database_url_unpooled: str | None = None
+    # Reuse prepared statements on each connection: one round trip per query instead of two.
+    # Neon's pooler (PgBouncer in transaction mode) supports them; turn off for a pooler that doesn't.
+    database_prepared_statements: bool = True
 
     # Deployed frontend origin(s), comma-separated, e.g. https://tu-truyen-nho.vercel.app
     frontend_url: str = ""

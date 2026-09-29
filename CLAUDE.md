@@ -16,8 +16,9 @@ Vercel Functions (serverless, Python runtime) + Neon Postgres (free plan).
 - Stateless: no in-memory state, no local files, no background schedulers (no APScheduler).
 - Scheduled jobs are protected HTTP endpoints (CRON_SECRET) called by Vercel Cron once a day;
   they must be idempotent and process work in small batches (well under 300s).
-- The app uses DATABASE_URL (Neon pooled), with a small pool suitable for serverless.
-  Alembic migrations use DATABASE_URL_DIRECT (non-pooled).
+- The app uses DATABASE_URL (Neon pooled, host contains "-pooler"), with a small pool suitable
+  for serverless. Alembic migrations use DATABASE_URL_UNPOOLED (Neon direct, non-pooled).
+  These are the names Neon writes; use no other names for them.
 - Images (covers, avatars) are stored as small WebP thumbnails in the database.
 
 ## Rules

@@ -14,11 +14,21 @@ class DiscoverLink(BaseModel):
     url: str
 
 
+class ProviderCredit(BaseModel):
+    """Where a result's data comes from, for an attribution badge ("MangaDex") linking back."""
+
+    provider: str  # "mangadex"
+    name: str  # "MangaDex"
+    url: str  # the work's page on the provider
+
+
 class DiscoverResult(BaseModel):
     provider: str  # the provider this result is added from (POST /api/library)
+    provider_name: str  # its display name, e.g. "MangaDex"
     external_id: str
     external_ids: dict[str, str]  # every id known for the work: {"mangadex": …, "anilist": …, "mal": …}
     providers: list[str]  # every provider that returned it (after merging duplicates)
+    attribution: list[ProviderCredit]  # the same providers, with names and links (the lead first)
     title: str
     alt_titles: list[str]
     description: str
@@ -37,6 +47,7 @@ class DiscoverPage(BaseModel):
     page: int
     results: list[DiscoverResult]
     providers: list[str]  # the providers asked
+    provider_names: dict[str, str]  # display names: {"mangadex": "MangaDex", "anilist": "AniList"}
     providers_failed: list[str]  # skipped: too slow, down or rate-limited (the search still answers)
 
 

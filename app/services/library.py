@@ -10,9 +10,10 @@ import logging
 import uuid
 
 import httpx
-from sqlalchemy import or_, select
+from sqlalchemy import exists, false, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.config import get_settings
 from app.core.errors import ApiError
@@ -112,30 +113,44 @@ async def _download_cover(url: str) -> bytes | None:
 # ── Finding or creating the work ─────────────────────────────────────────
 
 
+def _id_match(work: Work, details: ProviderResult) -> bool:
+    return any(details.external_ids.get(p) and (work.external_ids or {}).get(p) == details.external_ids[p] for p in INDEXED_IDS)
+
+
 async def _find_work(db: AsyncSession, details: ProviderResult) -> Work | None:
-    conds = [Work.external_ids[p].astext == details.external_ids[p] for p in INDEXED_IDS if details.external_ids.get(p)]
-    if conds:
-        work = await db.scalar(select(Work).where(Work.owner_user_id.is_(None), or_(*conds)).limit(1))
+    """The shared work with one of these external ids, else one that has one of these page links.
+    One query for every candidate (and one for their sources), whatever the number of links."""
+    ids = [Work.external_ids[p].astext == details.external_ids[p] for p in INDEXED_IDS if details.external_ids.get(p)]
+    links = [u for u in dict.fromkeys(normalize_url(link.url) for link in details.links) if identifies_work(u)]
+    has_link = (
+        exists().where(WorkSource.work_id == Work.id, WorkSource.url.in_(links), WorkSource.private_owner_id.is_(None))
+        if links
+        else false()
+    )
+    if not ids and not links:
+        return None
+    candidates = list(
+        await db.scalars(select(Work).where(Work.owner_user_id.is_(None), or_(*ids, has_link)).options(selectinload(Work.sources)))
+    )
+    by_id = next((w for w in candidates if _id_match(w, details)), None)
+    if by_id is not None:
+        return by_id
+    for url in links:  # in the provider's link order
+        work = next((w for w in candidates if any(s.url == url for s in w.sources)), None)
         if work is not None:
             return work
-    for link in details.links:
-        src = await comics.find_source_by_url(db, normalize_url(link.url), None)
-        if src is not None:
-            return await db.get(Work, src.work_id)
     return None
 
 
-async def _add_links(db: AsyncSession, work: Work, details: ProviderResult, user_id: uuid.UUID) -> None:
-    """Attach the provider's links the work doesn't have (links owned by another work are skipped)."""
-    await db.refresh(work, ["sources"])
+async def _add_links(db: AsyncSession, work: Work, details: ProviderResult, user_id: uuid.UUID, *, checked: bool = False) -> None:
+    """Attach the provider's links the work doesn't have (links owned by another work are skipped).
+    `checked`: _find_work just found no shared work with these links, so none is taken."""
     have = {s.url for s in work.sources}
     wanted = [normalize_url(link.url) for link in details.links]
-    # page links another shared work already has, in one query
-    taken = set(
-        await db.scalars(
-            select(WorkSource.url).where(WorkSource.url.in_([u for u in wanted if identifies_work(u)]), WorkSource.private_owner_id.is_(None))
-        )
-    )
+    missing = [u for u in wanted if u not in have and identifies_work(u)]
+    taken: set[str] = set()
+    if missing and not checked:  # page links another shared work already has, in one query
+        taken = set(await db.scalars(select(WorkSource.url).where(WorkSource.url.in_(missing), WorkSource.private_owner_id.is_(None))))
     for link, url in zip(details.links, wanted, strict=True):
         if url in have or url in taken:
             continue
@@ -160,12 +175,13 @@ def _enrich(work: Work, details: ProviderResult) -> None:
     work.latest_chapter = max(work.latest_chapter, details.latest_chapter or 0)
 
 
-async def work_from_details(db: AsyncSession, details: ProviderResult, user_id: uuid.UUID) -> Work:
+async def work_from_details(db: AsyncSession, details: ProviderResult, user_id: uuid.UUID) -> tuple[Work, bool]:
+    """→ (work with its sources loaded, created)."""
     work = await _find_work(db, details)
     if work is not None:
         _enrich(work, details)
         await _add_links(db, work, details, user_id)
-        return work
+        return work, False
 
     cover = await _download_cover(details.cover_url)
     work = Work(
@@ -181,37 +197,33 @@ async def work_from_details(db: AsyncSession, details: ProviderResult, user_id: 
         sources=[],
     )
     comics.set_work_cover(work, cover if cover else details.cover_url)
+    await _add_links(db, work, details, user_id, checked=True)
     try:
         async with db.begin_nested():  # someone saving the same work at the same moment
             db.add(work)
-            await db.flush()
+            await db.flush()  # the work and its sources, in one savepoint
     except IntegrityError:
         found = await _find_work(db, details)
         if found is None:
             raise
-        work = found
-    await _add_links(db, work, details, user_id)
-    return work
+        _enrich(found, details)
+        await _add_links(db, found, details, user_id)
+        return found, False
+    return work, True
 
 
 # ── The library item ─────────────────────────────────────────────────────
 
 
-async def _existing_item(db: AsyncSession, user_id: uuid.UUID, work_id: uuid.UUID) -> LibraryItem | None:
-    return await db.scalar(
-        comics.with_relations(select(LibraryItem).where(LibraryItem.user_id == user_id, LibraryItem.work_id == work_id))
-    )
-
-
 async def _new_item(db: AsyncSession, user_id: uuid.UUID, work: Work, data: LibraryAddIn) -> LibraryItem:
+    """A library item for a work whose sources are loaded (and flushed, so they have ids)."""
     await db.flush()
-    await db.refresh(work, ["sources"])
     item = LibraryItem(
         user_id=user_id,
         work=work,
         status=data.status or ("reading" if data.current_chapter else "plan_to_read"),
         current_chapter=data.current_chapter or 0,
-        primary_source_id=work.sources[0].id if work.sources else None,
+        primary_source_id=min(work.sources, key=lambda s: s.position).id if work.sources else None,
         hidden_source_ids=[],
         source_overrides={},
         tag_links=[],
@@ -234,12 +246,10 @@ async def add(db: AsyncSession, user_id: uuid.UUID, data: LibraryAddIn) -> tuple
 
     if data.url is not None:
         url = normalize_url(data.url)
-        if identifies_work(url):
-            src = await comics.find_source_by_url(db, url, None) or await comics.find_source_by_url(db, url, user_id)
-            if src is not None:
-                work = await db.get(Work, src.work_id)
-                existing = await _existing_item(db, user_id, work.id)
-                return (existing, False) if existing else (await _new_item(db, user_id, work, data), True)
+        work = await comics.work_with_links(db, user_id, [url])
+        if work is not None:
+            existing = await comics.item_for_work(db, user_id, work)
+            return (existing, False) if existing else (await _new_item(db, user_id, work, data), True)
         known = provider_for_link(url)
         if known is None:
             raise link_not_supported()
@@ -248,8 +258,9 @@ async def add(db: AsyncSession, user_id: uuid.UUID, data: LibraryAddIn) -> tuple
         provider_name, external_id = data.provider, data.external_id  # type: ignore[assignment]
 
     details = await fetch_work_details(db, provider_name, external_id)
-    work = await work_from_details(db, details, user_id)
-    existing = await _existing_item(db, user_id, work.id)
-    if existing is not None:
-        return existing, False
+    work, created = await work_from_details(db, details, user_id)
+    if not created:  # a brand-new work has no library items yet
+        existing = await comics.item_for_work(db, user_id, work)
+        if existing is not None:
+            return existing, False
     return await _new_item(db, user_id, work, data), True

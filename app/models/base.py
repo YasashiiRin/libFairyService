@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, MetaData, Uuid, func
+from sqlalchemy import DateTime, MetaData, Uuid, event, func, inspect
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 # Stable constraint names, so Alembic autogenerate produces clean, repeatable migrations.
@@ -16,6 +16,19 @@ NAMING_CONVENTION = {
 
 class Base(DeclarativeBase):
     metadata = MetaData(naming_convention=NAMING_CONVENTION)
+    # Server-generated values (created_at, updated_at, …) come back with the INSERT/UPDATE itself
+    # (RETURNING), so objects stay usable after a flush without reloading them.
+    __mapper_args__ = {"eager_defaults": True}
+
+
+@event.listens_for(Base, "init", propagate=True)
+def _unset_nullable_columns_are_none(target, args, kwargs) -> None:
+    """A new object starts with None in the nullable columns it isn't given: they are NULL once
+    inserted, and being known in memory the object needs no reload before it is shown."""
+    for attr in inspect(type(target)).column_attrs:
+        column = attr.columns[0]
+        if attr.key not in kwargs and column.nullable and column.default is None and column.server_default is None:
+            setattr(target, attr.key, None)
 
 
 def uuid_pk() -> Mapped[uuid.UUID]:

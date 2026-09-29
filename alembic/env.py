@@ -1,6 +1,6 @@
 """Alembic environment: async, on Neon's direct (non-pooled) connection.
 
-URL: DATABASE_URL_DIRECT, or DATABASE_URL_UNPOOLED as Neon writes it (see app/core/config.py).
+URL: DATABASE_URL_UNPOOLED, Neon's direct connection string (see app/core/config.py).
 """
 
 import asyncio
@@ -23,9 +23,9 @@ target_metadata = Base.metadata
 
 
 def migration_url() -> str:
-    url = get_settings().database_url_direct
+    url = get_settings().database_url_unpooled
     if not url:
-        raise RuntimeError("Set DATABASE_URL_DIRECT (Neon's non-pooled connection string) to run migrations.")
+        raise RuntimeError("Set DATABASE_URL_UNPOOLED (Neon's non-pooled connection string) to run migrations.")
     return to_asyncpg_url(url)
 
 

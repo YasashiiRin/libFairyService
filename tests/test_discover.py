@@ -3,11 +3,15 @@
 import uuid
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from sqlalchemy import func, select, update
 
 from app.core.config import get_settings
 from app.models import LibraryItem, SearchCache, Work, WorkSource
 from app.providers import PROVIDERS
+from app.providers.base import ProviderResult
+from app.services.discover import EXACT, NEAR_EXACT, OTHER, rank, title_match
+from tests import fake_providers as fake_providers_module
 from tests.fake_providers import LUKHACH_AL, LUKHACH_MD, TIEM_AL, TIEM_MD, VUON_MD
 from tests.helpers import signed_in
 from tests.test_comics import create
@@ -28,10 +32,17 @@ async def test_search_merges_providers(api, db_session, fake_providers):
     assert (body["query"], body["page"], body["providers"], body["providers_failed"]) == ("time grocery", 1, ["mangadex", "anilist"], [])
     [r] = body["results"]  # MangaDex's links.al = AniList's id: one result
     assert set(r) == {
-        "provider", "external_id", "external_ids", "providers", "title", "alt_titles", "description", "cover_url",
-        "authors", "genres", "status", "latest_chapter", "links", "in_library", "library_item_id",
+        "provider", "provider_name", "external_id", "external_ids", "providers", "attribution", "title", "alt_titles",
+        "description", "cover_url", "authors", "genres", "status", "latest_chapter", "links", "in_library", "library_item_id",
     }
     assert (r["provider"], r["external_id"], r["providers"]) == ("mangadex", TIEM_MD, ["mangadex", "anilist"])
+    # attribution: every provider the data comes from, named, linking to the work's page there
+    assert r["provider_name"] == "MangaDex"
+    assert r["attribution"] == [
+        {"provider": "mangadex", "name": "MangaDex", "url": f"https://mangadex.org/title/{TIEM_MD}"},
+        {"provider": "anilist", "name": "AniList", "url": f"https://anilist.co/manga/{TIEM_AL}"},
+    ]
+    assert body["provider_names"] == {"mangadex": "MangaDex", "anilist": "AniList"}
     assert r["external_ids"] == {"mangadex": TIEM_MD, "anilist": TIEM_AL, "mal": "201"}
     assert r["genres"] == ["Slice of Life", "Magic", "Supernatural"]  # union
     assert "Tiệm Tạp Hóa Thời Gian" in r["alt_titles"] and "Jikan no Zakkaya" in r["alt_titles"]
@@ -266,3 +277,60 @@ async def test_daily_cron(api, db_session, fake_providers):
 
 def test_both_providers_are_registered():
     assert list(PROVIDERS) == ["mangadex", "anilist"]
+
+
+# ── ranking ──────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("query", "title", "alt_titles", "expected"),
+    [
+        ("sousou no frieren", "Sousou no Frieren", [], EXACT),
+        ("SOUSOU NO FRIEREN!", "Sousou no Frieren", [], EXACT),  # case, punctuation
+        ("attack on titan", "Shingeki no Kyojin", ["Attack on Titan"], EXACT),  # an alt title
+        ("tiệm tạp hóa", "Time Grocery", ["Tiem Tap Hoa"], EXACT),  # accents
+        ("frieren", "Sousou no Frieren", ["Frieren: Beyond Journey's End"], NEAR_EXACT),  # an alt title's main part
+        ("dandadan", "Dandadan (Official Colored)", [], NEAR_EXACT),
+        ("solo leveling", "Solo Leveling - Ragnarok", [], NEAR_EXACT),
+        ("onepiece", "One Piece", [], NEAR_EXACT),  # spacing
+        ("promised neverland", "Yakusoku no Neverland", ["The Promised Neverland"], NEAR_EXACT),  # leading article
+        ("one peice", "One Piece", [], NEAR_EXACT),  # a small typo
+        ("freiren", "Frieren", [], NEAR_EXACT),
+        ("frieren", "Sousou no Frieren Anthology", ["Frieren Anthology"], OTHER),
+        ("naruto", "Boruto: Naruto Next Generations", [], OTHER),
+        ("berserk", "Berserker", [], OTHER),  # two letters off a 7-letter title: another title
+        ("ab", "Ac", [], OTHER),  # short titles need to match exactly
+    ],
+)
+def test_title_match(query, title, alt_titles, expected):
+    assert title_match(query, ProviderResult(provider="mangadex", external_id="x", title=title, alt_titles=alt_titles)) == expected
+
+
+def test_rank_moves_exact_matches_up_and_keeps_provider_order_otherwise():
+    def result(eid, title, alt=()):
+        return ProviderResult(provider="mangadex", external_id=eid, title=title, alt_titles=list(alt)), ["mangadex"]
+
+    merged = [
+        result("anthology", "Sousou no Frieren Anthology"),
+        result("guide", "Frieren Guidebook"),
+        result("main", "Sousou no Frieren", ["Frieren: Beyond Journey's End"]),
+        result("exact", "Frieren"),
+        result("other", "Frieren and the Mimic"),
+    ]
+    assert [r.external_id for r, _ in rank("frieren", merged)] == ["exact", "main", "anthology", "guide", "other"]
+
+
+async def test_search_puts_the_exact_title_first(api, db_session, fake_providers, monkeypatch):
+    """The providers rank a spin-off first; the work with the exact title comes first in the results."""
+    spin_off = "0b4b5f6e-9999-4c1a-9f00-000000000009"
+    monkeypatch.setattr(
+        fake_providers_module,
+        "MANGADEX",
+        {spin_off: fake_providers_module._manga(spin_off, "Time Grocery: After Hours", [], "Someone", [], "ongoing", "5", {}),
+         **fake_providers_module.MANGADEX},
+    )
+    headers = await signed_in(api, db_session)
+    results = (await search(api, headers, "time grocery"))["results"]
+    assert [r["external_id"] for r in results] == [TIEM_MD, spin_off]  # without ranking: spin-off first
+    assert [r["provider_name"] for r in results] == ["MangaDex", "MangaDex"]
+    assert [a["provider"] for a in results[1]["attribution"]] == ["mangadex"]

@@ -9,6 +9,7 @@ from typing import Any
 from app.providers.base import Link, Provider, ProviderError, ProviderResult, RateLimiter, clean_text, dedupe, dedupe_links, dedupe_names
 
 API = "https://graphql.anilist.co"
+SITE = "https://anilist.co/manga"
 PAGE_SIZE = 20
 STATUS = {"RELEASING": "ongoing", "FINISHED": "completed", "HIATUS": "hiatus", "CANCELLED": "cancelled"}
 AUTHOR_ROLES = ("story", "art", "original creator")
@@ -71,6 +72,10 @@ class AniList(Provider):
     name = "anilist"
     label = "AniList"
     limiter = RateLimiter(per_second=1)
+
+    @classmethod
+    def page_url(cls, external_id: str) -> str:
+        return f"{SITE}/{external_id}"
 
     async def _query(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
         res = await self._send("POST", API, json={"query": query, "variables": variables})

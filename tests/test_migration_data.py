@@ -37,7 +37,7 @@ async def migration_db():
 
 
 def migrate(url: str, *args: str) -> None:
-    env = {**os.environ, "DATABASE_URL_DIRECT": url}
+    env = {**os.environ, "DATABASE_URL_UNPOOLED": url}
     result = subprocess.run([sys.executable, "-m", "alembic", *args], env=env, capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
 

@@ -123,18 +123,20 @@ async def start_session(db: AsyncSession, user: User, device: DeviceInfo) -> tup
 
 async def refresh_access_token(db: AsyncSession, refresh_token: str, device: DeviceInfo) -> str:
     now = _now()
-    row = await db.scalar(
-        select(RefreshToken).where(
-            RefreshToken.token_hash == hash_token(refresh_token),
-            RefreshToken.revoked_at.is_(None),
-            RefreshToken.expires_at > now,
+    found = (
+        await db.execute(
+            select(RefreshToken, User)
+            .join(User, User.id == RefreshToken.user_id)
+            .where(
+                RefreshToken.token_hash == hash_token(refresh_token),
+                RefreshToken.revoked_at.is_(None),
+                RefreshToken.expires_at > now,
+            )
         )
-    )
-    if row is None:
+    ).first()
+    if found is None:
         raise invalid_refresh_token()
-    user = await db.get(User, row.user_id)
-    if user is None:
-        raise invalid_refresh_token()
+    row, user = found
     if not user.is_active:
         raise account_locked()
     row.last_active_at = now

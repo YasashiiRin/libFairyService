@@ -21,7 +21,7 @@ from app.models import LibraryItem, SearchCache, Work, WorkSource
 from app.providers import PROVIDERS, ProviderResult, get_provider
 from app.providers.base import dedupe, dedupe_links, dedupe_names, fold, name_key
 from app.providers.http import new_client
-from app.schemas.discover import DiscoverLink, DiscoverPage, DiscoverResult
+from app.schemas.discover import DiscoverLink, DiscoverPage, DiscoverResult, ProviderCredit
 from app.services.urls import identifies_work, normalize_url
 
 logger = logging.getLogger(__name__)
@@ -124,6 +124,76 @@ def merge_group(group: list[ProviderResult]) -> ProviderResult:
     )
 
 
+# ── Ranking ──────────────────────────────────────────────────────────────
+
+EXACT, NEAR_EXACT, OTHER = 2, 1, 0
+_ARTICLES = ("the ", "a ", "an ")
+# where a title's main part ends: "Frieren: Beyond Journey's End", "Solo Leveling - Ragnarok", "Dandadan (Official)"
+_SUBTITLE = re.compile(r"\s*(?::|\s[-–—~]\s|\(|\[|【)")
+
+
+def _typos_allowed(text: str) -> int:
+    """Small typos a near-exact match may have: none in short titles, one from 5 letters, two from 10."""
+    return 0 if len(text) < 5 else 1 if len(text) < 10 else 2
+
+
+def _edits(a: str, b: str, limit: int) -> int:
+    """Edit distance counting a swap of neighbours as one edit ("peice" / "piece"); stops above limit."""
+    if abs(len(a) - len(b)) > limit:
+        return limit + 1
+    prev2: list[int] = []
+    prev = list(range(len(b) + 1))
+    for i in range(1, len(a) + 1):
+        cur = [i] + [0] * len(b)
+        for j in range(1, len(b) + 1):
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] != b[j - 1]))
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                cur[j] = min(cur[j], prev2[j - 2] + 1)
+        if min(cur) > limit:
+            return limit + 1
+        prev2, prev = prev, cur
+    return prev[-1]
+
+
+def _variants(title: str) -> set[str]:
+    """A title as it is compared: folded, and its main part without a subtitle."""
+    out = {fold(title)}
+    main = _SUBTITLE.split(title, maxsplit=1)[0]
+    if main.strip():
+        out.add(fold(main))
+    return out - {""}
+
+
+def _without_article(text: str) -> str:
+    return next((text.removeprefix(a) for a in _ARTICLES if text.startswith(a)), text)
+
+
+def title_match(query: str, r: ProviderResult) -> int:
+    """EXACT when a title (the main one or any alternative) is the query, NEAR_EXACT when it is the
+    query up to spacing, a leading article, a subtitle or a small typo; OTHER otherwise."""
+    q = fold(query)
+    if not q:
+        return OTHER
+    titles = [t for t in [r.title, *r.alt_titles] if t]
+    if any(fold(t) == q for t in titles):
+        return EXACT
+    q_bare = _without_article(q).replace(" ", "")
+    typos = _typos_allowed(q_bare)
+    for t in titles:
+        for v in _variants(t):
+            bare = _without_article(v).replace(" ", "")
+            if bare == q_bare or (typos and _edits(bare, q_bare, typos) <= typos):
+                return NEAR_EXACT
+    return OTHER
+
+
+def rank(query: str, merged: list[tuple[ProviderResult, list[str]]]) -> list[tuple[ProviderResult, list[str]]]:
+    """Exact title matches first, then near-exact ones, then the rest; within each, the providers'
+    own order (interleaved) is kept. So "frieren" puts Sousou no Frieren (alt title "Frieren: Beyond
+    Journey's End") above an anthology the providers rank higher."""
+    return sorted(merged, key=lambda pair: -title_match(query, pair[0]))  # sorted() is stable
+
+
 # ── Search ───────────────────────────────────────────────────────────────
 
 
@@ -193,7 +263,7 @@ async def _library_matches(
 
 async def search(db: AsyncSession, user_id: uuid.UUID, query: str, page: int) -> DiscoverPage:
     lists, failed = await search_providers(db, query, page)
-    merged = merge(interleave(lists))
+    merged = rank(query, merge(interleave(lists)))
     by_id, by_url = await _library_matches(db, user_id, [r for r, _ in merged])
 
     results = []
@@ -204,9 +274,11 @@ async def search(db: AsyncSession, user_id: uuid.UUID, query: str, page: int) ->
         results.append(
             DiscoverResult(
                 provider=r.provider,
+                provider_name=PROVIDERS[r.provider].label,
                 external_id=r.external_id,
                 external_ids=r.external_ids,
                 providers=providers,
+                attribution=_credits(r, providers),
                 title=r.title,
                 alt_titles=r.alt_titles,
                 description=r.description,
@@ -220,4 +292,21 @@ async def search(db: AsyncSession, user_id: uuid.UUID, query: str, page: int) ->
                 library_item_id=item_id,
             )
         )
-    return DiscoverPage(query=query, page=page, results=results, providers=list(PROVIDERS), providers_failed=failed)
+    return DiscoverPage(
+        query=query,
+        page=page,
+        results=results,
+        providers=list(PROVIDERS),
+        provider_names={name: cls.label for name, cls in PROVIDERS.items()},
+        providers_failed=failed,
+    )
+
+
+def _credits(r: ProviderResult, providers: list[str]) -> list[ProviderCredit]:
+    """Every provider that returned the result, the lead first, each linking to the work's page there."""
+    ordered = [r.provider, *(p for p in providers if p != r.provider)]
+    return [
+        ProviderCredit(provider=p, name=PROVIDERS[p].label, url=PROVIDERS[p].page_url(r.external_ids.get(p) or r.external_id))
+        for p in ordered
+        if p in PROVIDERS and (r.external_ids.get(p) or p == r.provider)
+    ]

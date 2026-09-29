@@ -712,12 +712,15 @@ DiscoverPage = {
   query: string; page: number;
   results: DiscoverResult[];
   providers: string[];          // asked: ["mangadex", "anilist"]
-  providers_failed: string[];   // skipped this time
+  provider_names: Record<string, string>; // display names: { mangadex: "MangaDex", anilist: "AniList" }
+  providers_failed: string[];   // skipped this time (show their provider_names in the note)
 }
 DiscoverResult = {
   provider: string; external_id: string;       // what POST /api/library takes
+  provider_name: string;                       // the lead provider's display name: "MangaDex"
   external_ids: Record<string, string>;        // every id known: { mangadex, anilist, mal }
   providers: string[];                         // every provider that returned it
+  attribution: ProviderCredit[];               // the same providers, lead first: the attribution badges
   title: string; alt_titles: string[]; description: string;
   cover_url: string;                           // the provider's image
   authors: string[]; genres: string[];
@@ -727,12 +730,31 @@ DiscoverResult = {
   in_library: boolean;
   library_item_id: string | null;              // the user's Comic id when in_library
 }
+ProviderCredit = {
+  provider: string;   // "mangadex"
+  name: string;       // "MangaDex"
+  url: string;        // the work's page there, e.g. https://mangadex.org/title/…
+}
 ```
+
+Show a small badge per `attribution` entry ("MangaDex", "AniList") on each result, linking to its
+`url`: the data (and the cover image) comes from those providers, and MangaDex asks for credit.
 
 Duplicates across providers are merged into one result: first by a shared external ID (for example,
 MangaDex knows the AniList ID), then by the same normalised title plus a shared author (name order
 doesn't matter). A merged result is led by MangaDex when it has the work (a reading site first),
 and keeps the rank of its best member. Genres, alternative titles and links are combined.
+
+**Ranking.** Results whose title matches the query come first, whatever the providers' own order:
+
+1. **exact**: the title or any alternative title is the query (ignoring case, accents and punctuation);
+2. **near-exact**: the same up to spacing ("onepiece"), a leading article ("promised neverland" →
+   "The Promised Neverland"), a subtitle ("frieren" → "Frieren: Beyond Journey's End") or a small
+   typo (one letter from 5 letters, two from 10; a swap counts as one: "one peice");
+3. everything else.
+
+Within each group the providers' order is kept (best first from each provider, interleaved).
+Ranking applies within a page (`page` asks each provider for its next 20).
 
 Errors: **422** `validation_error` (`q` or `page` out of range).
 
