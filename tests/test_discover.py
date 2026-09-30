@@ -270,7 +270,7 @@ async def test_daily_cron(api, db_session, fake_providers):
         assert (await api.get(f"/api/comics/{comic['id']}", headers=headers)).status_code == 200  # saved works stay
         # idempotent
         again = (await api.get("/api/cron/daily", headers={"Authorization": "Bearer s3cret"})).json()
-        assert again == {"search_cache_deleted": 0, "orphan_works_deleted": 0}
+        assert (again["search_cache_deleted"], again["orphan_works_deleted"], again["feed_items_deleted"]) == (0, 0, 0)
     finally:
         settings.cron_secret = old
 

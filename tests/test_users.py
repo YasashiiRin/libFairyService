@@ -19,6 +19,9 @@ async def test_get_me(api, db_session):
         "notify_broken_link": True,
         "daily_reminder_enabled": False,
         "daily_reminder_time": "20:00",
+        "personalization_enabled": True,
+        "starter_tastes": [],
+        "priority_tastes": [],
     }
     assert "password_hash" not in me and "is_active" not in me
 

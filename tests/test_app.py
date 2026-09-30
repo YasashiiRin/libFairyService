@@ -64,3 +64,24 @@ async def test_validation_error_format():
     body = res.json()
     assert body["code"] == "validation_error"
     assert body["detail"].startswith("Dữ liệu chưa hợp lệ: n:")
+
+
+def test_vercel_serves_the_app_with_the_request_path():
+    """Vercel's FastAPI preset serves pyproject's [tool.vercel] entrypoint and passes the path it was routed
+    with: a rewrite in vercel.json (e.g. "/(.*)" → "/api/index") would reach FastAPI as that destination,
+    a 404 for every route. The function settings must name the entrypoint's file, or they aren't applied."""
+    import importlib
+    import json
+    import tomllib
+    from pathlib import Path
+
+    root = Path(__file__).parent.parent
+    vercel = json.loads((root / "vercel.json").read_text())
+    entrypoint = tomllib.loads((root / "pyproject.toml").read_text())["tool"]["vercel"]["entrypoint"]
+    module, variable = entrypoint.split(":")
+    assert "rewrites" not in vercel and "routes" not in vercel
+    assert list(vercel["functions"]) == [module.replace(".", "/") + ".py"]
+    assert vercel["functions"][module.replace(".", "/") + ".py"]["maxDuration"] == 60
+    app = getattr(importlib.import_module(module), variable)
+    assert {"/api/health", "/api/home", "/api/cron/daily"} <= set(app.openapi()["paths"])
+    assert [c["path"] for c in vercel["crons"]] == ["/api/cron/daily"]

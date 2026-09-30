@@ -22,7 +22,7 @@ from app.providers import PROVIDERS, ProviderError, ProviderResult, get_provider
 from app.providers.http import new_client
 from app.schemas.comic import ComicCreate
 from app.schemas.discover import LibraryAddIn
-from app.services import comics, images
+from app.services import comics, feed, images
 from app.services.discover import INDEXED_IDS, cache_get, cache_key, cache_put, merge_group
 from app.services.urls import identifies_work, normalize_url
 
@@ -263,4 +263,6 @@ async def add(db: AsyncSession, user_id: uuid.UUID, data: LibraryAddIn) -> tuple
         existing = await comics.item_for_work(db, user_id, work)
         if existing is not None:
             return existing, False
-    return await _new_item(db, user_id, work, data), True
+    item = await _new_item(db, user_id, work, data)
+    await feed.forget_saved(db, user_id, {**(work.external_ids or {}), provider_name: external_id})
+    return item, True

@@ -3,6 +3,7 @@
 from app.models.auth import PasswordResetToken, RefreshToken
 from app.models.base import Base
 from app.models.cache import SearchCache
+from app.models.feed import FeedBuild, FeedDismissal, FeedItem
 from app.models.library import LibraryItem, LibraryItemTag, Tag
 from app.models.notification import Notification
 from app.models.reading import ReadingGoal, ReadingLog
@@ -12,6 +13,9 @@ from app.models.work import Work, WorkSource
 
 __all__ = [
     "Base",
+    "FeedBuild",
+    "FeedDismissal",
+    "FeedItem",
     "LibraryItem",
     "LibraryItemTag",
     "Notification",

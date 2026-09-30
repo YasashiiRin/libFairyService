@@ -5,6 +5,7 @@ only (never chapter pages or images), credit to MangaDex (results carry provider
 and no adult content (content ratings safe and suggestive only).
 """
 
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -19,6 +20,7 @@ from app.providers.base import (
     dedupe,
     dedupe_links,
     dedupe_names,
+    name_key,
 )
 
 API = "https://api.mangadex.org"
@@ -75,6 +77,11 @@ def parse_manga(data: dict[str, Any]) -> ProviderResult:
         if isinstance(url, str) and url.startswith(("http://", "https://")):
             sources.append(Link(site_name=_site_name(url), url=url))
 
+    year = attrs.get("year") if isinstance(attrs.get("year"), int) else None
+    created = str(attrs.get("createdAt") or "")[:10]
+    # the day it was added to MangaDex is the best "started" date when it is from the same year
+    started_on = (created if created.startswith(str(year)) else str(year)) if year else None
+
     return ProviderResult(
         provider="mangadex",
         external_id=manga_id,
@@ -89,6 +96,7 @@ def parse_manga(data: dict[str, Any]) -> ProviderResult:
         latest_chapter=chapter_number(attrs.get("lastChapter")),
         links=dedupe_links(sources),
         external_ids=external_ids,
+        started_on=started_on,
     )
 
 
@@ -136,6 +144,63 @@ class MangaDex(Provider):
         if result.latest_chapter is None:
             result.latest_chapter = await self.latest_chapter(external_id)
         return result
+
+    # ── the home feed ─────────────────────────────────────────────────────
+
+    async def tag_ids(self) -> dict[str, str]:
+        """Every MangaDex tag: {English name: id} (the feed filters by genre and theme tags)."""
+        body = await self._get("/manga/tag", [])
+        return {
+            name: t["id"]
+            for t in body.get("data") or []
+            if (name := ((t.get("attributes") or {}).get("name") or {}).get("en"))
+        }
+
+    async def browse(
+        self,
+        *,
+        tag_ids: tuple[str, ...] | list[str] = (),
+        order: str = "followedCount",
+        year: int | None = None,
+        updated_within_days: int | None = None,
+        author_id: str | None = None,
+        limit: int = 20,
+    ) -> list[ProviderResult]:
+        """Works with any of these tags (or by this author), with chapters to read; safe and suggestive
+        only, as in search (CONTENT_RATINGS: never erotica or pornographic)."""
+        params: list[tuple[str, Any]] = [
+            ("limit", limit),
+            (f"order[{order}]", "desc"),
+            ("hasAvailableChapters", "true"),
+            ("includes[]", "cover_art"),
+            ("includes[]", "author"),
+            ("includes[]", "artist"),
+            *(("contentRating[]", r) for r in CONTENT_RATINGS),
+        ]
+        if tag_ids:
+            params += [("includedTagsMode", "OR"), *(("includedTags[]", t) for t in tag_ids)]
+        if year:
+            params.append(("year", year))
+        if updated_within_days:
+            since = datetime.now(UTC) - timedelta(days=updated_within_days)
+            params.append(("updatedAtSince", since.strftime("%Y-%m-%dT%H:%M:%S")))
+        if author_id:
+            params.append(("authorOrArtist", author_id))
+        body = await self._get("/manga", params)
+        return [parse_manga(m) for m in body.get("data") or []]
+
+    async def find_author(self, name: str) -> str | None:
+        """The id of the author with exactly this name (ignoring case and name order), if any."""
+        body = await self._get("/author", [("name", name), ("limit", 5)])
+        want = name_key(name)
+        return next((a["id"] for a in body.get("data") or [] if name_key((a.get("attributes") or {}).get("name") or "") == want), None)
+
+    async def statistics(self, external_ids: list[str]) -> dict[str, int]:
+        """Follows per work (MangaDex's popularity), for up to 100 works in one request."""
+        if not external_ids:
+            return {}
+        body = await self._get("/statistics/manga", [("manga[]", i) for i in external_ids[:100]])
+        return {mid: int((s or {}).get("follows") or 0) for mid, s in (body.get("statistics") or {}).items()}
 
     async def latest_chapter(self, external_id: str) -> int | None:
         """The highest chapter number in the feed (any language): one request, one row."""

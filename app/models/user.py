@@ -19,6 +19,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "notify_broken_link": True,
     "daily_reminder_enabled": False,
     "daily_reminder_time": "20:00",
+    # the home feed "Khu vườn hôm nay": false = only the sections that aren't about her taste
+    "personalization_enabled": True,
+    # moods picked while the library is small (app/services/taste.py MOODS), e.g. ["Chữa lành"]
+    "starter_tastes": [],
+    # moods above every other taste: they lead each personal section of the home feed
+    "priority_tastes": [],
 }
 
 

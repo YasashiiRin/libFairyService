@@ -5,16 +5,18 @@ from fastapi import APIRouter, File, Response, UploadFile, status
 from app.api.deps import CurrentAuth, Db
 from app.core.errors import ApiError
 from app.models import User
+from app.models.user import DEFAULT_SETTINGS
 from app.schemas.auth import PasswordChangeIn
 from app.schemas.user import (
     DeviceSessionOut,
     ProfileUpdate,
     RevokedOut,
     UserOut,
+    StarterTastesIn,
     UserSettingsUpdate,
 )
 from app.services import auth as auth_service
-from app.services import images
+from app.services import feed, images
 
 router = APIRouter(prefix="/users/me", tags=["users"])
 
@@ -43,9 +45,13 @@ def _refuse_other_fields(data: ProfileUpdate) -> None:
         )
 
 
-def _merge_settings(user: User, patch: UserSettingsUpdate) -> None:
+async def _merge_settings(db: Db, user: User, patch: UserSettingsUpdate) -> None:
+    changes = patch.model_dump(exclude_unset=True, exclude_none=True)
+    current = {**DEFAULT_SETTINGS, **(user.settings or {})}
+    if any(key in changes and changes[key] != current[key] for key in ("personalization_enabled", "priority_tastes")):
+        await feed.reset_today(db, user.id)  # today's home feed is built again with the new setting
     # a new dict, so SQLAlchemy sees the JSONB change
-    user.settings = {**(user.settings or {}), **patch.model_dump(exclude_unset=True, exclude_none=True)}
+    user.settings = {**(user.settings or {}), **changes}
 
 
 def _set_avatar(user: User, webp: bytes | None) -> None:
@@ -67,7 +73,7 @@ async def update_me(data: ProfileUpdate, auth: CurrentAuth, db: Db) -> UserOut:
     if "avatar" in data.model_fields_set:
         _set_avatar(user, images.avatar_thumbnail(images.decode_data_url(data.avatar)) if data.avatar else None)
     if data.settings is not None:
-        _merge_settings(user, data.settings)
+        await _merge_settings(db, user, data.settings)
     await db.commit()
     return UserOut.from_model(user)
 
@@ -83,10 +89,23 @@ async def upload_avatar(auth: CurrentAuth, db: Db, file: UploadFile = File()) ->
 
 @router.patch("/settings")
 async def update_settings(data: UserSettingsUpdate, auth: CurrentAuth, db: Db) -> UserOut:
-    """PATCH /api/users/me/settings body Partial<UserSettings> → User; 422 validation_error"""
-    _merge_settings(auth.user, data)
+    """PATCH /api/users/me/settings body Partial<UserSettings> → User; 422 validation_error
+    (starter_tastes is set with PUT /api/users/me/starter-tastes; priority_tastes: moods, at most 4)"""
+    await _merge_settings(db, auth.user, data)
     await db.commit()
     return UserOut.from_model(auth.user)
+
+
+@router.put("/starter-tastes")
+async def set_starter_tastes(data: StarterTastesIn, auth: CurrentAuth, db: Db) -> UserOut:
+    """PUT /api/users/me/starter-tastes body { starter_tastes: string[] } → User
+    (moods from GET /api/home starter_options; [] clears them). Today's home feed is built again.
+    422 validation_error (an unknown mood, or more than there are)"""
+    user = auth.user
+    user.settings = {**(user.settings or {}), "starter_tastes": data.starter_tastes}
+    await feed.reset_today(db, user.id)
+    await db.commit()
+    return UserOut.from_model(user)
 
 
 @router.post("/password", status_code=status.HTTP_204_NO_CONTENT)

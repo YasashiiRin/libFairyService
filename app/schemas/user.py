@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_vali
 
 from app.models.user import DEFAULT_SETTINGS, User
 from app.services.images import media_url
+from app.services.taste import MAX_PRIORITY, MOODS
 
 DISPLAY_NAME_MAX = 40  # ProfileSection NAME_MAX
 BIO_MAX = 160  # ProfileSection BIO_MAX
@@ -23,6 +24,16 @@ class UserSettings(BaseModel):
     notify_broken_link: bool
     daily_reminder_enabled: bool
     daily_reminder_time: ReminderTime
+    personalization_enabled: bool
+    starter_tastes: list[str]
+    priority_tastes: list[str]
+
+
+def _known_moods(v: list[str]) -> list[str]:
+    unknown = [t for t in v if t not in MOODS]
+    if unknown:
+        raise ValueError(f"Chưa có gu “{unknown[0]}”. Nàng chọn trong: {', '.join(MOODS)}")
+    return list(dict.fromkeys(v))
 
 
 class UserSettingsUpdate(BaseModel):
@@ -37,6 +48,28 @@ class UserSettingsUpdate(BaseModel):
     notify_broken_link: bool | None = None
     daily_reminder_enabled: bool | None = None
     daily_reminder_time: ReminderTime | None = None
+    personalization_enabled: bool | None = None
+    # moods (GET /api/home starter_options) that lead every personal section; [] clears them
+    priority_tastes: list[str] | None = Field(default=None, max_length=MAX_PRIORITY)
+    # starter_tastes: PUT /api/users/me/starter-tastes (checked against the list of moods)
+
+    @field_validator("priority_tastes")
+    @classmethod
+    def _priority_known(cls, v: list[str] | None) -> list[str] | None:
+        return None if v is None else _known_moods(v)
+
+
+class StarterTastesIn(BaseModel):
+    """PUT /api/users/me/starter-tastes: the moods she likes (from GET /api/home starter_options)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    starter_tastes: list[str] = Field(max_length=len(MOODS))
+
+    @field_validator("starter_tastes")
+    @classmethod
+    def _known(cls, v: list[str]) -> list[str]:
+        return _known_moods(v)
 
 
 class UserOut(BaseModel):

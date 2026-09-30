@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     search_cache_ttl_hours: int = 6
     # Vercel Cron calls /api/cron/daily with "Authorization: Bearer <CRON_SECRET>".
     cron_secret: str = ""
+    # The home feed: how long the first home request of the day may spend building it (the rest is
+    # added on the next request), and the daily cron's time budget (Vercel stops it at maxDuration).
+    feed_build_seconds: float = 5.0
+    feed_retry_seconds: float = 2.0  # finishing a partial feed on a later request
+    cron_budget_seconds: float = 40.0
 
     @property
     def cors_origins(self) -> list[str]:

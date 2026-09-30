@@ -61,6 +61,8 @@ class Work(Base):
     # the highest chapter a reader reached above latest_chapter: a sign latest_chapter is outdated
     # (the daily check refreshes works where latest_chapter_hint > latest_chapter)
     latest_chapter_hint: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # when the daily job last asked the provider for the latest chapter
+    chapters_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # external cover link; an uploaded cover is stored once in `cover` (small WebP) instead
     cover_url: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
     cover: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True, deferred=True)

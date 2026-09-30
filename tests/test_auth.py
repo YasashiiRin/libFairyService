@@ -13,7 +13,7 @@ from tests.helpers import IPHONE_UA, PASSWORD, bearer, expired_access_token, log
 USER_FIELDS = {"id", "username", "email", "display_name", "bio", "avatar_url", "role", "created_at", "last_backup_at", "settings"}
 SETTINGS_FIELDS = {
     "theme", "font_size", "sparkle_enabled", "notify_new_chapter", "notify_broken_link",
-    "daily_reminder_enabled", "daily_reminder_time",
+    "daily_reminder_enabled", "daily_reminder_time", "personalization_enabled", "starter_tastes", "priority_tastes",
 }
 
 

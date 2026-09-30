@@ -24,6 +24,8 @@ USERNAME = "bemeolac"
 PASSWORD = "12012007"
 DISPLAY_NAME = "Uyên"
 EMAIL = "bemeolac@example.com"
+# what leads her home feed ("Khu vườn hôm nay"), above everything else she likes
+PRIORITY_TASTES = ["Bách hợp (GL)", "Đam mỹ (BL)"]
 
 SHELVES = [
     # key, name, description, icon, color (palette ids from the frontend's SHELF_COLORS)
@@ -196,7 +198,7 @@ async def seed(session: AsyncSession, *, reset: bool = False) -> str:
         display_name=DISPLAY_NAME,
         bio="Người trông coi khu vườn chữ và những trang truyện thơm mùi thảo mộc. 🌸📖",
         role="user",
-        settings=default_settings(),
+        settings={**default_settings(), "priority_tastes": PRIORITY_TASTES},
         created_at=now - timedelta(days=365),
     )
     session.add(user)

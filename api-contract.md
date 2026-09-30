@@ -15,6 +15,7 @@ Field names are snake_case on the wire, exactly as in those types.
 - [Comics](#comics)
 - [Discover (search across the web)](#discover)
 - [Library (saving)](#library)
+- [Home ("Khu vườn hôm nay")](#home)
 - [Shelves](#shelves)
 - [Sources](#sources)
 - [Tags](#tags)
@@ -259,6 +260,9 @@ UserSettings = {
   theme: 'day' | 'night'; font_size: number; sparkle_enabled: boolean;
   notify_new_chapter: boolean; notify_broken_link: boolean;
   daily_reminder_enabled: boolean; daily_reminder_time: string; // "HH:MM"
+  personalization_enabled: boolean; // default true; false: the home feed isn't about her taste
+  starter_tastes: string[];         // moods picked while the library is small; set with PUT …/starter-tastes
+  priority_tastes: string[];        // moods above every other taste: they lead the home feed (default [])
 }
 ```
 
@@ -309,6 +313,27 @@ Errors: **422** `validation_error`.
 
 Used by: `/account/appearance` and the theme toggle in the header (`theme`,
 `font_size`, `sparkle_enabled`), and `/account/notifications` (`notify_*`, `daily_reminder_*`).
+
+`starter_tastes` can't be set here (use `PUT /api/users/me/starter-tastes`).
+
+`priority_tastes`: at most 4 moods from `GET /api/home` `starter_options` (for example
+`["Bách hợp (GL)", "Đam mỹ (BL)"]`); duplicates are dropped, `[]` clears them. An unknown mood or more
+than 4 → **422** `validation_error`. See [Priority tastes](#get-apihome).
+
+Changing `personalization_enabled` or `priority_tastes` rebuilds today's home feed on the next `GET /api/home`.
+
+### `PUT /api/users/me/starter-tastes`
+
+Request: `{ "starter_tastes": string[] }`: moods from `GET /api/home` `starter_options`
+(`"Chữa lành"`, `"Cổ tích"`, `"Lãng mạn"`, `"Phiêu lưu"`, `"Hài hước"`, `"Học đường"`, `"Kỳ ảo"`,
+`"Đời thường"`, `"Bách hợp (GL)"`, `"Đam mỹ (BL)"`), at most one of each; duplicates are dropped, `[]` clears them. They shape the home feed while the library
+has fewer than 5 comics. Today's feed is built again on the next `GET /api/home`.
+
+Response **200** `User`.
+
+Errors: **422** `validation_error` (an unknown mood, more than there are, or another field).
+
+Used by: `/` (the "Nàng thích đọc gì?" picker, when `needs_starter_tastes`).
 
 ### `POST /api/users/me/password`
 
@@ -795,6 +820,111 @@ Used by: `/search` ("Thêm vào tủ"), `/add`.
 
 ---
 
+## Home
+
+"Khu vườn hôm nay": the home page shows her comics to continue, then what is new each day for her
+taste (from MangaDex and AniList, safe content only: MangaDex content ratings `safe` and `suggestive`,
+never erotica or pornographic; AniList `isAdult: false`, no Hentai or Ecchi). Service: `src/services/homeService.ts`
+(frontend, not built yet).
+
+### `GET /api/home`
+
+Response **200**:
+
+```ts
+HomeOut = {
+  date: string;                     // "YYYY-MM-DD" (Vietnam time): the feed's day
+  personalization_enabled: boolean;
+  needs_starter_tastes: boolean;    // fewer than 5 comics, no starter or priority tastes: show the mood picker
+  starter_tastes: string[];
+  priority_tastes: string[];        // settings.priority_tastes: they lead for_you, new_releases, trending
+  starter_options: { value: string; label: string; icon: string }[];
+  feed_status: 'ready' | 'building' | 'off';
+  sections: HomeSection[];          // always in this order (see below)
+}
+HomeSection = {
+  key: 'continue_reading' | 'new_chapters' | 'for_you' | 'new_releases' | 'trending';
+  title: string;                    // "Đọc tiếp nhé", "Có chương mới", "Dành cho nàng", "Mới ra mắt hợp gu", "Đang được yêu thích"
+  kind: 'library' | 'feed';
+  comics: Comic[];                  // kind "library": her own comics (up to 10)
+  items: FeedItem[];                // kind "feed": suggestions
+}
+FeedItem = {
+  provider: string; provider_name: string; external_id: string; // save with POST /api/library { provider, external_id }
+  external_ids: Record<string, string>;
+  title: string; cover_url: string; authors: string[]; genres: string[];
+  latest_chapter: number | null;
+  status: 'ongoing' | 'completed' | 'hiatus' | 'cancelled' | 'unknown';
+  attribution: ProviderCredit[];    // as in Discover: badges linking back to the providers
+  reason: string;                   // "Vì nàng thích Chữa lành", "Giống Frieren mà nàng chấm 5 tim", "Bách hợp mới ra mắt", …
+  score: number;
+}
+```
+
+Sections, in order:
+
+| key | kind | What |
+| --- | --- | --- |
+| `continue_reading` | library | "Đang đọc" comics she has started, most recently read first |
+| `new_chapters` | library | comics with an unread new chapter (not repeated in `continue_reading`) |
+| `for_you` | feed | AniList recommendations for works she loved, works by her favourite authors, works in her top genres (up to 16) |
+| `new_releases` | feed | series started in the last year, in her genres (up to 12) |
+| `trending` | feed | what readers love right now, in her genres (up to 12) |
+
+With `personalization_enabled: false`, `for_you` is left out and `new_releases` / `trending` are
+everyone's (reasons "Mới ra mắt gần đây", "Đang được nhiều người yêu thích"); `feed_status` is `"off"`.
+A new user with no comics and no starter tastes also gets everyone's lists, and `needs_starter_tastes`.
+
+**Building.** The feed is built once a day per user: by the daily cron for active users, or here on
+the first request of the day. That first request waits at most `FEED_BUILD_SECONDS` (5 s) for the
+providers. If some didn't answer in time, it returns what is ready with `feed_status: "building"`;
+the next request (waiting at most 2 s) or the cron adds the rest. Answers already fetched are cached,
+so nothing is asked twice. After 3 tries the feed is left as it is. Once built, the request only reads.
+
+**Taste** comes from her own data only: the genres, tags and authors of her comics, weighted by status
+(completed and reading count more, dropped counts against), rating, favourite, and how recently she
+read them. Suggestions she dismissed count against their genres and authors. Her own Vietnamese tags
+match the providers' genres ("Đời thường" = "Slice of Life"). Works already in her library (by any id,
+or by title) and dismissed works are never suggested.
+
+**Ranking.** Score = taste match + provider popularity + freshness, weighted per section. A work
+appears in one section only. Within a section, no more than 3 in a row share an author or a main genre,
+and a genre is named in at most 3 reasons before a work's next matching genre is named instead.
+
+**Priority tastes** (`settings.priority_tastes`, set with `PATCH /api/users/me/settings`) come above
+every other taste signal. The feed asks the providers for them directly (new, trending and best-loved
+works in each), so it doesn't depend on what is already in her library. `for_you`, `new_releases`
+and `trending` each start with works in a priority taste (their score is raised by 2, more than
+anything else can add), then are filled with her other good matches. Among the priority works only the
+author rule applies (no more than 3 in a row by one author). Their reasons name the taste:
+"Bách hợp mới ra mắt" (`new_releases`), "Đam mỹ đang được yêu thích" (`trending`), "Vì nàng mê Bách hợp"
+or "Bách hợp, giống Frieren mà nàng chấm 5 tim" (`for_you`). They apply only with personalization on.
+
+| Mood | MangaDex tag | AniList |
+| --- | --- | --- |
+| `Bách hợp (GL)` | `Girls' Love` | tag `Yuri` (rank ≥ 60) |
+| `Đam mỹ (BL)` | `Boys' Love` | tag `Boys' Love` (rank ≥ 60) |
+
+AniList has no genre for these, only tags: a work where one is central (rank ≥ 60) lists it in `genres`
+under MangaDex's name (`"Girls' Love"`, `"Boys' Love"`).
+
+Used by: `/` (not built yet).
+
+### `POST /api/home/dismiss`
+
+Request: `{ "provider": string, "external_id": string }` ("Không hứng thú").
+
+The work leaves the feed and is never suggested again (under any of its ids); its genres and authors
+count a little against her taste. Idempotent.
+
+Response **204**.
+
+Errors: **422** `validation_error`.
+
+Saving a suggestion uses `POST /api/library` `{ provider, external_id }`; it then leaves the feed.
+
+---
+
 ## Shelves
 
 Service: [`src/services/shelfService.ts`](../src/services/shelfService.ts). Membership
@@ -1051,13 +1181,27 @@ Used by: `/notifications` (swipe or delete button).
 Called by Vercel Cron once a day at 20:00 UTC (03:00 in Vietnam; see `vercel.json`) with
 `Authorization: Bearer <CRON_SECRET>`. Idempotent and quick. It:
 
-- deletes expired `search_cache` rows,
-- deletes works nobody has in their library any more (after an account is deleted).
+- deletes expired `search_cache` rows, works nobody has in their library any more (after an account
+  is deleted), and home feed items older than 3 days;
+- checks the latest chapter of a small batch (15) of saved works on MangaDex (else AniList): works a
+  reader got further in (`latest_chapter_hint`) first, then the ones checked longest ago. A higher
+  chapter sets `has_new_chapter` for readers who had caught up, and sends them a `new_chapter`
+  notification ("“Tên truyện” đã có chương 125 🌸") if `notify_new_chapter` is on;
+- builds today's home feed for active users (signed in within 30 days), one at a time, until its time
+  budget (`CRON_BUDGET_SECONDS`, 40 s; `maxDuration` is 60 s) runs low. Users left over get theirs
+  on their first home visit.
 
-Coming next: refreshing `latest_chapter` from the providers for works where a reader got further
-(`latest_chapter_hint`), and checking source links.
+Coming next: checking source links.
 
-Response **200** `{ "search_cache_deleted": number, "orphan_works_deleted": number }`.
+Response **200**:
+
+```ts
+{
+  search_cache_deleted: number; orphan_works_deleted: number; feed_items_deleted: number;
+  chapters_checked: number; chapters_updated: number; new_chapter_notifications: number;
+  feeds_built: number;
+}
+```
 
 Errors: **401** `not_authenticated` (wrong secret), **503** `cron_not_configured` (no `CRON_SECRET`).
 
@@ -1077,6 +1221,7 @@ Errors: **401** `not_authenticated` (wrong secret), **503** `cron_not_configured
 | PATCH    | `/api/users/me`                              | `userService.updateProfile`                | `/account/profile`                        |
 | PUT      | `/api/users/me/avatar`                       | `userService.uploadAvatar`                 | `/account/profile`                        |
 | PATCH    | `/api/users/me/settings`                     | `userService.updateSettings`               | `/account/appearance`, `/account/notifications`, theme toggle |
+| PUT      | `/api/users/me/starter-tastes`               | — (`homeService`, not built yet)           | `/`                                       |
 | POST     | `/api/users/me/password`                     | `userService.changePassword`               | `/account/security`                       |
 | GET      | `/api/users/me/sessions`                     | `userService.getSessions`                  | `/account/security`                       |
 | DELETE   | `/api/users/me/sessions`                     | `userService.logoutAll`                    | `/account/security`                       |
@@ -1103,7 +1248,9 @@ Errors: **401** `not_authenticated` (wrong secret), **503** `cron_not_configured
 | GET      | `/api/comics/{id}/cover?v=&sig=`             | (`<img src>` of `cover_url`)               | every page with covers                    |
 | GET      | `/api/users/{id}/avatar?v=&sig=`             | (`<img src>` of `avatar_url`)              | header, `/account`                        |
 | GET      | `/api/discover/search`                       | `discoverService.search`                   | `/search` (Khám phá), `/add`              |
-| POST     | `/api/library`                               | `discoverService.addToLibrary`             | `/search` (Khám phá), `/add`              |
+| POST     | `/api/library`                               | `discoverService.addToLibrary`             | `/search` (Khám phá), `/add`, `/`         |
+| GET      | `/api/home`                                  | — (`homeService`, not built yet)           | `/`                                       |
+| POST     | `/api/home/dismiss`                          | — (`homeService`, not built yet)           | `/`                                       |
 | GET      | `/api/cron/daily`                            | — (Vercel Cron)                            | —                                         |
 | GET      | `/api/shelves`                               | `shelvesService.list`                      | `/`, `/add`, `/comics/:id`, `/shelves/:id`|
 | GET      | `/api/shelves/{id}`                          | `shelvesService.getShelfById`              | `/shelves/:id`                            |

@@ -41,13 +41,18 @@ class ProviderResult:
     links: list[Link] = field(default_factory=list)  # where to read (reading sites, official pages)
     # every id this provider knows for the work, its own included: {"mangadex": …, "anilist": …, "mal": …}
     external_ids: dict[str, str] = field(default_factory=dict)
+    # for the home feed's ranking (None = unknown)
+    popularity: int | None = None  # AniList members / MangaDex follows
+    trending: int | None = None  # AniList's trending score (recent activity)
+    started_on: str | None = None  # "YYYY-MM-DD" (or "YYYY-MM", "YYYY") when publication started
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> "ProviderResult":
-        return cls(**{**data, "links": [Link(**link) for link in data.get("links", [])]})
+        known = {f for f in cls.__dataclass_fields__}  # cached answers may predate a field (or keep a removed one)
+        return cls(**{k: v for k, v in data.items() if k in known and k != "links"}, links=[Link(**link) for link in data.get("links", [])])
 
 
 class ProviderError(Exception):

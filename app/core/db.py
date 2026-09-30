@@ -19,6 +19,8 @@ PING_AFTER_IDLE_SECONDS = 10
 # Requests that run without a transaction: reads, and endpoints whose writes are single statements.
 # Saves BEGIN and COMMIT/ROLLBACK (two round trips).
 AUTOCOMMIT_PATHS = {"/api/auth/login", "/api/auth/refresh"}
+# Reads that also write (today's home feed, the daily jobs): one transaction, like other writes.
+TRANSACTION_PATHS = {"/api/home", "/api/cron/daily"}
 
 
 def to_asyncpg_url(url: str) -> str:
@@ -90,7 +92,8 @@ def create_engine(url: str) -> AsyncEngine:
 
 
 def uses_autocommit(request: Request) -> bool:
-    return request.method in ("GET", "HEAD") or request.url.path in AUTOCOMMIT_PATHS
+    path = request.url.path
+    return (request.method in ("GET", "HEAD") and path not in TRANSACTION_PATHS) or path in AUTOCOMMIT_PATHS
 
 
 engine = create_engine(get_settings().database_url)

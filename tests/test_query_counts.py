@@ -88,8 +88,8 @@ async def test_saving_from_search(api, db_session, db_engine, fake_providers):
         res = await api.post("/api/library", json={"provider": "mangadex", "external_id": VUON_MD}, headers=headers)
     assert res.status_code == 201
     # BEGIN; auth; details cache read + write; one lookup for the work (ids and links together);
-    # savepoint, work, its sources, release; the item — the saved comic is not read back
-    assert len(sent) == 10, sent
+    # savepoint, work, its sources, release; the item; it leaves the home feed — the saved comic is not read back
+    assert len(sent) == 11, sent
 
     with statements(db_engine) as sent:
         again = await api.post("/api/library", json={"provider": "mangadex", "external_id": VUON_MD}, headers=headers)
