@@ -118,11 +118,32 @@ def known_total(item: LibraryItem) -> int:
 def cover_url_of(item: LibraryItem) -> str:
     """Stored images are served under the item's own signed URL (a personal cover, else the work's)."""
     work = item.work
-    if item.custom_cover_updated_at:
-        return images.media_url("cover", item.id, item.custom_cover_updated_at)
-    if item.custom_cover_url is not None:
-        return item.custom_cover_url
-    return images.media_url("cover", item.id, work.cover_updated_at) if work.cover_updated_at else work.cover_url
+    return cover_url_from(item.id, item.custom_cover_updated_at, item.custom_cover_url, work.cover_updated_at, work.cover_url)
+
+
+def cover_url_from(
+    item_id: uuid.UUID,
+    custom_cover_updated_at: datetime | None,
+    custom_cover_url: str | None,
+    work_cover_updated_at: datetime | None,
+    work_cover_url: str,
+) -> str:
+    """cover_url_of from the columns alone (shelf covers are read without loading whole comics)."""
+    if custom_cover_updated_at:
+        return images.media_url("cover", item_id, custom_cover_updated_at)
+    if custom_cover_url is not None:
+        return custom_cover_url
+    return images.media_url("cover", item_id, work_cover_updated_at) if work_cover_updated_at else work_cover_url
+
+
+# the columns cover_url_from reads, for queries that select them directly
+COVER_COLUMNS = (
+    LibraryItem.id,
+    LibraryItem.custom_cover_updated_at,
+    LibraryItem.custom_cover_url,
+    Work.cover_updated_at,
+    Work.cover_url,
+)
 
 
 def visible_sources(item: LibraryItem) -> list[WorkSource]:

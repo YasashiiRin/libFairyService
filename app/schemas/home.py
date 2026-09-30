@@ -1,14 +1,13 @@
-"""GET /api/home ("Khu vườn hôm nay") and POST /api/home/dismiss (api-contract.md#home)."""
+"""GET /api/home ("Thế giới") and POST /api/home/dismiss (api-contract.md#home)."""
 
 from datetime import date
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.schemas.comic import ComicOut
 from app.schemas.discover import ProviderCredit, PublicationStatus
 
-SectionKey = Literal["continue_reading", "new_chapters", "for_you", "new_releases", "trending"]
+SectionKey = Literal["for_you", "new_releases", "trending"]
 
 
 class FeedItemOut(BaseModel):
@@ -32,9 +31,7 @@ class FeedItemOut(BaseModel):
 class HomeSection(BaseModel):
     key: SectionKey
     title: str
-    kind: Literal["library", "feed"]  # library: comics (her own); feed: items (suggestions)
-    comics: list[ComicOut] = []
-    items: list[FeedItemOut] = []
+    items: list[FeedItemOut]
 
 
 class StarterOption(BaseModel):

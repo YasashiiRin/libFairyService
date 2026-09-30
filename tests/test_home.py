@@ -15,7 +15,7 @@ from tests.helpers import signed_in
 from tests.test_comics import create
 from tests.test_query_counts import statements
 
-SECTION_KEYS = ["continue_reading", "new_chapters", "for_you", "new_releases", "trending"]
+SECTION_KEYS = ["for_you", "new_releases", "trending"]
 
 
 async def home(api, headers) -> dict:
@@ -33,7 +33,7 @@ def ids(body, key) -> list[str]:
 
 
 def all_items(body) -> list[dict]:
-    return [i for s in body["sections"] if s["kind"] == "feed" for i in s["items"]]
+    return [i for s in body["sections"] for i in s["items"]]
 
 
 async def saved_library(api, headers) -> dict:
@@ -62,12 +62,12 @@ async def test_home_for_her_taste(api, db_session, fake_providers, quick_feed):
     body = await home(api, headers)
 
     assert [s["key"] for s in body["sections"]] == SECTION_KEYS
-    assert [s["title"] for s in body["sections"]] == ["Đọc tiếp nhé", "Có chương mới", "Dành cho nàng", "Mới ra mắt hợp gu", "Đang được yêu thích"]
+    assert [s["title"] for s in body["sections"]] == ["Dành cho nàng", "Mới ra mắt hợp gu", "Đang được yêu thích"]
+    assert all(set(s) == {"key", "title", "items"} for s in body["sections"])  # suggestions only, never her own comics
     assert body["feed_status"] == "ready" and body["personalization_enabled"] is True
     assert body["needs_starter_tastes"] is True  # 2 comics, no starter tastes yet
     assert [o["value"] for o in body["starter_options"]][:3] == ["Chữa lành", "Cổ tích", "Lãng mạn"]
-    # her own comics first
-    assert [c["id"] for c in section(body, "continue_reading")["comics"]] == [tiem["id"]]
+    assert tiem["id"] not in str(body)
 
     for_you = {i["external_id"]: i for i in section(body, "for_you")["items"]}
     # an AniList recommendation for Time Grocery, which she rated 5 hearts
@@ -153,7 +153,7 @@ async def test_personalization_off(api, db_session, fake_providers, quick_feed):
     assert res.status_code == 200 and res.json()["settings"]["personalization_enabled"] is False
 
     body = await home(api, headers)
-    assert [s["key"] for s in body["sections"]] == ["continue_reading", "new_chapters", "new_releases", "trending"]
+    assert [s["key"] for s in body["sections"]] == ["new_releases", "trending"]
     assert body["feed_status"] == "off" and body["needs_starter_tastes"] is False
     reasons = {i["reason"] for i in all_items(body)}
     assert reasons <= {"Mới ra mắt gần đây", "Đang được nhiều người yêu thích"}
@@ -203,8 +203,13 @@ async def test_home_round_trips_once_built(api, db_session, db_engine, fake_prov
     await home(api, headers)
     with statements(db_engine) as sent:
         await home(api, headers)
-    # BEGIN; auth; today's build; her comics (+ sources, tags, shelves); today's feed; library size
-    assert len(sent) == 9, sent
+    # BEGIN; auth; today's build; today's feed; library size (no starter tastes yet)
+    assert len(sent) == 5, sent
+    await api.put("/api/users/me/starter-tastes", json={"starter_tastes": ["Chữa lành"]}, headers=headers)
+    await home(api, headers)
+    with statements(db_engine) as sent:
+        await home(api, headers)
+    assert len(sent) == 4, sent  # she told us her taste: the library's size isn't needed
 
 
 async def test_daily_cron_builds_feeds_and_finds_new_chapters(api, db_session, fake_providers):
@@ -234,9 +239,8 @@ async def test_daily_cron_builds_feeds_and_finds_new_chapters(api, db_session, f
         assert note.type == "new_chapter" and note.message == "“Time Grocery” đã có chương 125 🌸"
         body = await home(api, headers)  # already built by the cron: no provider asked
         assert body["feed_status"] == "ready"
-        new = section(body, "new_chapters")["comics"]
-        assert [c["id"] for c in new] == [tiem["id"]] and new[0]["has_new_chapter"] and new[0]["total_chapters"] == 125
-        assert tiem["id"] not in [c["id"] for c in section(body, "continue_reading")["comics"]]  # shown once
+        saved = (await api.get(f"/api/comics/{tiem['id']}", headers=headers)).json()
+        assert saved["has_new_chapter"] and saved["total_chapters"] == 125
 
         # idempotent: nothing new the second time
         again = (await api.get("/api/cron/daily", headers={"Authorization": "Bearer s3cret"})).json()

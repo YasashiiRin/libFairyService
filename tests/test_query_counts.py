@@ -71,6 +71,26 @@ async def test_reading_the_bookshelf(api, db_session, db_engine):
     assert len(sent) == 5  # auth; item with its work; sources; tags; shelves
 
 
+async def test_reading_shelves(api, db_session, db_engine):
+    headers = await signed_in(api, db_session)
+    ids = [(await api.post("/api/shelves", json={"name": f"Kệ {n}"}, headers=headers)).json()["id"] for n in range(3)]
+    for i in range(9):
+        await create(api, headers, title=f"Truyện {i}", shelf_ids=ids[: i % 3 + 1], cover_url=f"https://img.example/{i}.jpg",
+                     sources=[{"site_name": "S", "url": f"https://s.example/ke-{i}", "favicon_url": ""}])
+
+    with statements(db_engine) as sent:
+        listed = (await api.get("/api/shelves", headers=headers)).json()
+    assert [s["comic_count"] for s in listed] == [9, 9, 6, 3] and all(len(s["cover_urls"]) == 4 for s in listed[:3])
+    # auth; her shelves with their positions and counts; every shelf's covers (and the library's size) at once
+    assert len(sent) == 3 and "BEGIN" not in sent, sent
+
+    with statements(db_engine) as sent:
+        detail = (await api.get(f"/api/shelves/{ids[1]}", headers=headers)).json()
+    assert (detail["comic_count"], detail["completed_count"]) == (6, 0)
+    # auth; the shelf with its position and stats; its covers
+    assert len(sent) == 3 and "BEGIN" not in sent, sent
+
+
 async def test_updating_progress(api, db_session, db_engine):
     headers = await signed_in(api, db_session)
     comic = await create(api, headers, current_chapter=3, total_chapters=40)
